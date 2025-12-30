@@ -1,12 +1,10 @@
 import os
 import re
 import json
-import numpy as np
+import math
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify
 import requests
-import pandas as pd
-from typing import Dict, List, Optional, Tuple, Any
 import logging
 from dataclasses import dataclass
 import hashlib
@@ -116,7 +114,7 @@ class TimeframeCalculator:
     
     def calculate_signal_parameters(self, entry_price: float, direction: str, 
                                    instrument_type: str, timeframe: str,
-                                   market_data: Dict = None) -> Dict[str, Any]:
+                                   market_data: dict = None) -> dict:
         """Calculate all signal parameters based on timeframe"""
         
         # Get timeframe configuration
@@ -174,17 +172,20 @@ class TimeframeCalculator:
         # Calculate signal validity
         valid_until = datetime.now(timezone.utc) + timedelta(hours=tf_config.valid_for_hours)
         
+        # Format numbers
+        price_decimals = base_params['price_decimals']
+        
         return {
-            'stop_loss': round(sl_price, base_params['price_decimals']),
-            'take_profit_1': round(tp1_price, base_params['price_decimals']),
-            'take_profit_2': round(tp2_price, base_params['price_decimals']),
-            'take_profit_3': round(tp3_price, base_params['price_decimals']),
+            'stop_loss': round(sl_price, price_decimals),
+            'take_profit_1': round(tp1_price, price_decimals),
+            'take_profit_2': round(tp2_price, price_decimals),
+            'take_profit_3': round(tp3_price, price_decimals),
             'risk_reward_ratio': round(rr_ratio, 2),
             'position_size': position_size,
             'valid_until': valid_until.isoformat(),
             'timeframe_multiplier': tf_config.multiplier,
             'min_confidence': tf_config.min_confidence,
-            'price_decimals': base_params['price_decimals']
+            'price_decimals': price_decimals
         }
     
     def calculate_position_size(self, entry_price: float, sl_distance: float, 
@@ -202,7 +203,7 @@ class TimeframeCalculator:
         # Ensure minimum size
         return max(min_size, round(quantity, 4))
     
-    def analyze_timeframe_quality(self, timeframe: str, instrument_type: str) -> Dict[str, Any]:
+    def analyze_timeframe_quality(self, timeframe: str, instrument_type: str) -> dict:
         """Analyze if timeframe is suitable for the instrument"""
         tf_config = self.get_timeframe_config(timeframe)
         
@@ -230,7 +231,7 @@ class SignalValidator:
         self.timeframe_calc = TimeframeCalculator()
         self.signal_history = {}
     
-    def validate_enhanced_signal(self, signal_data: Dict) -> Dict[str, Any]:
+    def validate_enhanced_signal(self, signal_data: dict) -> dict:
         """Validate signal with all parameters"""
         
         validation = {
@@ -329,7 +330,7 @@ class SignalValidator:
         
         return validation
     
-    def _create_signal_hash(self, signal_data: Dict) -> str:
+    def _create_signal_hash(self, signal_data: dict) -> str:
         """Create unique hash for signal"""
         hash_string = f"{signal_data.get('pair', '')}{signal_data.get('action', '')}{signal_data.get('price', '')}"
         return hashlib.md5(hash_string.encode()).hexdigest()
@@ -361,8 +362,8 @@ def parse_timeframe(tf_str: str) -> str:
     
     return tf_map.get(tf_str, tf_str)
 
-def format_telegram_message(signal_data: Dict, validation: Dict, 
-                           signal_params: Dict) -> str:
+def format_telegram_message(signal_data: dict, validation: dict, 
+                           signal_params: dict) -> str:
     """Format enhanced Telegram message"""
     
     action = signal_data.get('action', '')
@@ -414,7 +415,7 @@ def format_telegram_message(signal_data: Dict, validation: Dict,
     message += f"• Status: `{'VALID ✅' if validation.get('is_valid', False) else 'REJECTED ❌'}`\n"
     
     if validation.get('warnings'):
-        message += f"• Warnings: `{', '.join(validation['warnings'])}`\n"
+        message += f"• Warnings: `{', '.join(validation['warnings'][:3])}`\n"
     
     # Market context if available
     if 'adx_val' in signal_data:
@@ -435,6 +436,27 @@ def format_telegram_message(signal_data: Dict, validation: Dict,
         message += f"• Valid Until: `{valid_time.strftime('%H:%M UTC')}`\n"
     
     return message
+
+def detect_instrument_type(pair: str) -> str:
+    """Detect instrument type from pair name"""
+    pair = str(pair).upper()
+    
+    # Indices
+    indices = ['GER30', 'NAS100', 'SPX500', 'US30', 'UK100', 'JPN225', 'DXY', 'NQ', 'ES', 'YM']
+    if any(index in pair for index in indices):
+        return 'INDICES'
+    
+    # Commodities
+    commodities = ['XAU', 'GOLD', 'XAG', 'SILVER', 'OIL', 'BRENT', 'WTI', 'XPT', 'PLATINUM', 'CL', 'GC']
+    if any(comm in pair for comm in commodities):
+        return 'COMMODITIES'
+    
+    # Crypto
+    cryptos = ['BTC', 'ETH', 'XRP', 'ADA', 'SOL', 'DOT', 'BNB', 'MATIC', 'AVAX']
+    if any(crypto in pair for crypto in cryptos):
+        return 'CRYPTO'
+    
+    return 'FOREX'  # Default
 
 @app.route('/webhook', methods=['POST', 'GET'])
 def handle_webhook():
@@ -503,15 +525,7 @@ def handle_webhook():
             signal_data['timeframe'] = '1H'  # Default
         
         # Determine instrument type
-        pair = signal_data['pair'].upper()
-        if any(x in pair for x in ['GER30', 'NAS100', 'SPX500', 'US30']):
-            signal_data['instrument_type'] = 'INDICES'
-        elif any(x in pair for x in ['XAU', 'GOLD', 'XAG', 'OIL']):
-            signal_data['instrument_type'] = 'COMMODITIES'
-        elif any(x in pair for x in ['BTC', 'ETH', 'XRP', 'ADA']):
-            signal_data['instrument_type'] = 'CRYPTO'
-        else:
-            signal_data['instrument_type'] = 'FOREX'
+        signal_data['instrument_type'] = detect_instrument_type(signal_data['pair'])
         
         logger.info(f"Signal: {signal_data['pair']} {signal_data['action']} @ {signal_data.get('price', 0)} TF:{signal_data['timeframe']}")
         
@@ -521,19 +535,23 @@ def handle_webhook():
         
         # Calculate signal parameters based on timeframe
         if validation['is_valid'] and signal_data.get('price', 0) > 0:
-            signal_params = timeframe_calc.calculate_signal_parameters(
-                entry_price=float(signal_data['price']),
-                direction=signal_data['action'],
-                instrument_type=signal_data['instrument_type'],
-                timeframe=signal_data['timeframe'],
-                market_data=signal_data
-            )
+            try:
+                signal_params = timeframe_calc.calculate_signal_parameters(
+                    entry_price=float(signal_data['price']),
+                    direction=signal_data['action'],
+                    instrument_type=signal_data['instrument_type'],
+                    timeframe=signal_data['timeframe'],
+                    market_data=signal_data
+                )
+            except Exception as e:
+                logger.error(f"Error calculating signal parameters: {e}")
+                signal_params = {}
         else:
             signal_params = {}
         
         # Send to Telegram if valid and credentials available
         if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-            if validation['is_valid']:
+            if validation['is_valid'] and signal_params:
                 # Format message
                 message = format_telegram_message(signal_data, validation, signal_params)
                 
@@ -600,7 +618,7 @@ def handle_webhook():
     finally:
         logger.info("=" * 70)
 
-def log_signal(signal_data: Dict, validation: Dict, parameters: Dict):
+def log_signal(signal_data: dict, validation: dict, parameters: dict):
     """Log successful signal for analysis"""
     log_entry = {
         'timestamp': datetime.now(timezone.utc).isoformat(),
@@ -613,74 +631,6 @@ def log_signal(signal_data: Dict, validation: Dict, parameters: Dict):
     logger.info(f"Signal logged: {signal_data.get('pair')} {signal_data.get('action')} "
                 f"(Confidence: {validation.get('confidence', 0):.1%})")
 
-@app.route('/timeframe-info/<tf>', methods=['GET'])
-def get_timeframe_info(tf):
-    """Get information about a specific timeframe"""
-    calc = TimeframeCalculator()
-    
-    try:
-        config = calc.get_timeframe_config(tf)
-        
-        return jsonify({
-            "timeframe": tf,
-            "config": {
-                "multiplier": config.multiplier,
-                "risk_multiplier": config.risk_multiplier,
-                "sl_multiplier": config.sl_multiplier,
-                "tp_multiplier": config.tp_multiplier,
-                "min_confidence": config.min_confidence,
-                "valid_for_hours": config.valid_for_hours
-            },
-            "optimal_for": {
-                "forex": tf in ['15m', '1H', '4H', '1D'],
-                "indices": tf in ['15m', '1H', '4H', '1D'],
-                "commodities": tf in ['1H', '4H', '1D'],
-                "crypto": tf in ['5m', '15m', '1H', '4H']
-            }
-        }), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-@app.route('/calculate-signal', methods=['POST'])
-def calculate_signal():
-    """Calculate signal parameters based on input"""
-    try:
-        data = request.get_json()
-        
-        required_fields = ['pair', 'action', 'price', 'timeframe']
-        if not all(field in data for field in required_fields):
-            return jsonify({"error": "Missing required fields"}), 400
-        
-        calc = TimeframeCalculator()
-        
-        # Determine instrument type
-        pair = data['pair'].upper()
-        if any(x in pair for x in ['GER30', 'NAS100', 'SPX500', 'US30']):
-            instrument = 'INDICES'
-        elif any(x in pair for x in ['XAU', 'GOLD', 'XAG', 'OIL']):
-            instrument = 'COMMODITIES'
-        elif any(x in pair for x in ['BTC', 'ETH', 'XRP', 'ADA']):
-            instrument = 'CRYPTO'
-        else:
-            instrument = 'FOREX'
-        
-        # Calculate parameters
-        params = calc.calculate_signal_parameters(
-            entry_price=float(data['price']),
-            direction=data['action'],
-            instrument_type=instrument,
-            timeframe=data['timeframe']
-        )
-        
-        return jsonify({
-            "parameters": params,
-            "instrument_type": instrument,
-            "timeframe_analysis": calc.analyze_timeframe_quality(data['timeframe'], instrument)
-        }), 200
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({
@@ -688,16 +638,61 @@ def health():
         "service": "Timeframe-Aware Trading Bot",
         "version": "7.0",
         "mode": ALERT_MODE,
-        "timeframe_configs_count": len(TimeframeCalculator.TIMEFRAME_CONFIGS),
         "telegram_configured": bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID),
         "timestamp": datetime.now(timezone.utc).isoformat()
     }), 200
+
+@app.route('/test', methods=['POST'])
+def test_signal():
+    """Test endpoint for signal processing"""
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+        
+        # Initialize processors
+        validator = SignalValidator()
+        timeframe_calc = TimeframeCalculator()
+        
+        # Parse data
+        signal_data = data.copy()
+        
+        # Add required fields if missing
+        if 'timeframe' not in signal_data:
+            signal_data['timeframe'] = '1H'
+        
+        if 'instrument_type' not in signal_data and 'pair' in signal_data:
+            signal_data['instrument_type'] = detect_instrument_type(signal_data['pair'])
+        
+        # Validate
+        validation = validator.validate_enhanced_signal(signal_data)
+        
+        # Calculate parameters
+        if signal_data.get('price', 0) > 0:
+            signal_params = timeframe_calc.calculate_signal_parameters(
+                entry_price=float(signal_data.get('price', 0)),
+                direction=signal_data.get('action', ''),
+                instrument_type=signal_data.get('instrument_type', 'FOREX'),
+                timeframe=signal_data.get('timeframe', '1H'),
+                market_data=signal_data
+            )
+        else:
+            signal_params = {}
+        
+        return jsonify({
+            "signal_data": signal_data,
+            "validation": validation,
+            "parameters": signal_params
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
     logger.info(f"🚀 Starting Timeframe-Aware Trading Bot v7.0 on port {port}")
     logger.info(f"🔧 Alert Mode: {ALERT_MODE}")
     logger.info(f"🤖 Telegram configured: {bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)}")
-    logger.info(f"⏰ Timeframe configurations loaded: {len(TimeframeCalculator.TIMEFRAME_CONFIGS)}")
     
     app.run(host='0.0.0.0', port=port, debug=False)
