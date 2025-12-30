@@ -42,6 +42,44 @@ def get_current_time():
     """Get current UTC time in HH:MM format"""
     return datetime.now(timezone.utc).strftime('%H:%M UTC')
 
+def format_timeframe(interval):
+    """
+    Convert TradingView interval to readable format.
+    TradingView sends: 1, 5, 15, 30, 60, 120, 240, 360, 480, 720, 1440, "D", "W", "M"
+    """
+    if not interval:
+        return "N/A"
+    
+    interval_str = str(interval).upper()
+    
+    timeframe_map = {
+        '1': '1m', '5': '5m', '15': '15m', '30': '30m',
+        '60': '1H', '120': '2H', '240': '4H', '360': '6H',
+        '480': '8H', '720': '12H', '1440': '1D', 'D': '1D',
+        'W': '1W', 'M': '1M', '365': '1D', '10080': '1W'
+    }
+    
+    # Check for exact matches
+    if interval_str in timeframe_map:
+        return timeframe_map[interval_str]
+    
+    # Check if it's a number of minutes
+    try:
+        minutes = int(interval_str)
+        if minutes < 60:
+            return f"{minutes}m"
+        elif minutes == 60:
+            return "1H"
+        elif minutes < 1440:
+            return f"{minutes//60}H"
+        elif minutes == 1440:
+            return "1D"
+        else:
+            days = minutes // 1440
+            return f"{days}D"
+    except:
+        return interval_str  # Return as-is if unknown
+
 def detect_instrument_type(pair):
     """Detect instrument type based on pair name"""
     pair = str(pair).upper()
@@ -65,10 +103,7 @@ def detect_instrument_type(pair):
     return 'forex'
 
 def calculate_tp_sl(entry_price, direction, instrument_type):
-    """
-    Calculate Take Profit and Stop Loss levels
-    Returns: (tp1, tp2, tp3, sl)
-    """
+    """Calculate Take Profit and Stop Loss levels"""
     try:
         entry = float(entry_price)
         params = RISK_PARAMS.get(instrument_type, RISK_PARAMS['forex'])
@@ -203,9 +238,16 @@ def parse_tradingview_alert(data):
     price = 'N/A'
     raw_price = None
     action = 'N/A'
+    timeframe = 'N/A'
     message = data.get('message', '')
     
-    # Extract pair
+    # ===== EXTRACT TIMEFRAME =====
+    # TradingView sends interval in multiple possible fields
+    interval = data.get('interval') or data.get('strategy.interval') or data.get('timeframe')
+    if interval:
+        timeframe = format_timeframe(interval)
+    
+    # ===== EXTRACT PAIR =====
     pair = data.get('ticker') or data.get('symbol') or data.get('pair')
     if not pair or pair == 'N/A':
         if message and message.startswith('['):
@@ -218,8 +260,8 @@ def parse_tradingview_alert(data):
             if pair_match:
                 pair = pair_match.group(1)
     
-    # Extract price
-    price_str = data.get('close') or data.get('price')
+    # ===== EXTRACT PRICE =====
+    price_str = data.get('close') or data.get('price') or data.get('strategy.order.price')
     if not price_str or price_str == 'N/A':
         if message and message.startswith('['):
             parsed = parse_malformed_string(message)
@@ -246,7 +288,7 @@ def parse_tradingview_alert(data):
         price = price_str or 'N/A'
         raw_price = None
     
-    # Extract action
+    # ===== EXTRACT ACTION =====
     action = data.get('strategy.order.action') or data.get('action')
     if not action or action == 'N/A':
         if message and message.startswith('['):
@@ -266,6 +308,7 @@ def parse_tradingview_alert(data):
         'raw_price': raw_price,
         'action': clean_action,
         'detail': detail_action,
+        'timeframe': timeframe,
         'is_exit': is_exit,
         'raw_action': action
     }
@@ -285,6 +328,7 @@ def send_telegram_signal(signal_data):
         signal += f"• *PAIR*: `{signal_data['pair']}`\n"
         signal += f"• *ACTION*: `{signal_data['detail']}`\n"
         signal += f"• *PRICE*: `{signal_data['price']}`\n"
+        signal += f"• *TIMEFRAME*: `{signal_data['timeframe']}`\n"
         signal += f"• *TIME*: `{get_current_time()}`"
     
     else:
@@ -294,6 +338,7 @@ def send_telegram_signal(signal_data):
         signal += f"• *PAIR*: `{signal_data['pair']}`\n"
         signal += f"• *DIRECTION*: `{signal_data['detail']}`\n"
         signal += f"• *ENTRY PRICE*: `{signal_data['price']}`\n"
+        signal += f"• *TIMEFRAME*: `{signal_data['timeframe']}`\n"
         
         # Calculate TP/SL if we have raw price
         if signal_data['raw_price']:
@@ -363,7 +408,8 @@ def handle_webhook():
                 "signal_type": "exit" if signal_data['is_exit'] else "entry",
                 "pair": signal_data['pair'],
                 "action": signal_data['detail'],
-                "price": signal_data['price']
+                "price": signal_data['price'],
+                "timeframe": signal_data['timeframe']
             }
             return jsonify(response), 200
         else:
@@ -384,7 +430,7 @@ def health_check():
     return jsonify({
         "status": "alive",
         "service": "QuantumScalperBot",
-        "version": "3.0",
+        "version": "4.0",
         "timestamp": get_current_time()
     }), 200
 
