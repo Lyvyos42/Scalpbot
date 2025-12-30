@@ -8,7 +8,6 @@ import requests
 import logging
 from dataclasses import dataclass
 import hashlib
-import time
 
 app = Flask(__name__)
 
@@ -149,13 +148,13 @@ class TimeframeCalculator:
             tp_distance = entry_price * (tp_percent / 100)
         
         # Calculate actual price levels
-        if direction == 'BUY' or direction == 'LONG':
+        if direction in ['LONG', 'BUY']:  # Support both old and new naming
             sl_price = entry_price - sl_distance
             tp1_price = entry_price + (tp_distance * 0.5)
             tp2_price = entry_price + tp_distance
             tp3_price = entry_price + (tp_distance * 1.5)
             rr_ratio = tp_distance / sl_distance if sl_distance > 0 else 0
-        else:  # SELL or SHORT
+        else:  # SHORT or SELL
             sl_price = entry_price + sl_distance
             tp1_price = entry_price - (tp_distance * 0.5)
             tp2_price = entry_price - tp_distance
@@ -181,7 +180,7 @@ class TimeframeCalculator:
             'take_profit_2': round(tp2_price, price_decimals),
             'take_profit_3': round(tp3_price, price_decimals),
             'risk_reward_ratio': round(rr_ratio, 2),
-            'position_size': position_size,
+            'position_size': round(position_size, 4),
             'valid_until': valid_until.isoformat(),
             'timeframe_multiplier': tf_config.multiplier,
             'min_confidence': tf_config.min_confidence,
@@ -201,7 +200,7 @@ class TimeframeCalculator:
         quantity = (risk_percent / 100) / (risk_per_unit / entry_price)
         
         # Ensure minimum size
-        return max(min_size, round(quantity, 4))
+        return max(min_size, quantity)
     
     def analyze_timeframe_quality(self, timeframe: str, instrument_type: str) -> dict:
         """Analyze if timeframe is suitable for the instrument"""
@@ -250,6 +249,9 @@ class SignalValidator:
             timeframe = signal_data.get('timeframe', '1H')
             instrument_type = signal_data.get('instrument_type', 'FOREX')
             
+            # Normalize action for validation
+            action_normalized = self._normalize_action(action)
+            
             # Check if signal is expired
             if 'entry_time' in signal_data:
                 entry_time = datetime.fromtimestamp(signal_data['entry_time'] / 1000, timezone.utc)
@@ -284,7 +286,7 @@ class SignalValidator:
                 adx_val = signal_data['adx_val']
                 is_ranging = signal_data['ranging']
                 
-                if not is_ranging and action in ['BUY', 'SELL']:
+                if not is_ranging and action_normalized in ['LONG', 'SHORT']:
                     # Mean reversion strategy works best in ranging markets
                     validation['warnings'].append("Market is trending (ADX > 25)")
                     validation['confidence'] *= 0.6
@@ -300,12 +302,13 @@ class SignalValidator:
             if all(k in signal_data for k in ['bb_upper', 'bb_middle', 'bb_lower']):
                 upper = signal_data['bb_upper']
                 lower = signal_data['bb_lower']
+                current_price = float(price)
                 
                 # Check if price is at band extremes for mean reversion
-                if action == 'BUY' and price > lower * 1.01:
+                if action_normalized == 'LONG' and current_price > lower * 1.01:
                     validation['warnings'].append("Price not at lower Bollinger Band")
                     validation['confidence'] *= 0.9
-                elif action == 'SELL' and price < upper * 0.99:
+                elif action_normalized == 'SHORT' and current_price < upper * 0.99:
                     validation['warnings'].append("Price not at upper Bollinger Band")
                     validation['confidence'] *= 0.9
             
@@ -329,6 +332,29 @@ class SignalValidator:
             validation['rejection_reasons'].append(f"Validation error: {str(e)}")
         
         return validation
+    
+    def _normalize_action(self, action: str) -> str:
+        """Normalize action to standard format"""
+        if not action:
+            return ''
+        
+        action = str(action).upper().strip()
+        
+        # Map to consistent naming
+        action_map = {
+            'BUY': 'LONG',
+            'BUYING': 'LONG',
+            'LONG': 'LONG',
+            'SELL': 'SHORT',
+            'SELLING': 'SHORT',
+            'SHORT': 'SHORT',
+            'EXIT_LONG': 'EXIT_LONG',
+            'EXIT_SHORT': 'EXIT_SHORT',
+            'CLOSE_LONG': 'EXIT_LONG',
+            'CLOSE_SHORT': 'EXIT_SHORT'
+        }
+        
+        return action_map.get(action, action)
     
     def _create_signal_hash(self, signal_data: dict) -> str:
         """Create unique hash for signal"""
@@ -362,81 +388,6 @@ def parse_timeframe(tf_str: str) -> str:
     
     return tf_map.get(tf_str, tf_str)
 
-def format_telegram_message(signal_data: dict, validation: dict, 
-                           signal_params: dict) -> str:
-    """Format enhanced Telegram message"""
-    
-    action = signal_data.get('action', '')
-    pair = signal_data.get('pair', '')
-    price = signal_data.get('price', '')
-    timeframe = signal_data.get('timeframe', '')
-    
-    # Determine emoji and title
-    if 'EXIT' in action:
-        emoji = "🔴"
-        title = "EXIT SIGNAL"
-    elif action in ['BUY', 'LONG']:
-        emoji = "🟢"
-        title = "LONG ENTRY"
-    else:  # SELL or SHORT
-        emoji = "🔵"
-        title = "SHORT ENTRY"
-    
-    message = f"{emoji} *{title}* {emoji}\n\n"
-    
-    # Basic info
-    message += f"*Instrument:* `{pair}`\n"
-    message += f"*Action:* `{action}`\n"
-    message += f"*Entry:* `{price}`\n"
-    message += f"*Timeframe:* `{timeframe}`\n"
-    
-    # Timeframe analysis
-    tf_calc = TimeframeCalculator()
-    tf_config = tf_calc.get_timeframe_config(timeframe)
-    tf_analysis = tf_calc.analyze_timeframe_quality(timeframe, signal_data.get('instrument_type', 'FOREX'))
-    
-    message += f"\n*⏰ Timeframe Analysis:*\n"
-    message += f"• Multiplier: `{tf_config.multiplier}x`\n"
-    message += f"• Optimal: `{'✅' if tf_analysis['is_optimal'] else '⚠️'}`\n"
-    message += f"• Valid for: `{tf_config.valid_for_hours}h`\n"
-    
-    # Signal parameters
-    message += f"\n*📊 Signal Parameters:*\n"
-    message += f"• Stop Loss: `{signal_params.get('stop_loss', 'N/A')}`\n"
-    message += f"• Take Profit 1: `{signal_params.get('take_profit_1', 'N/A')}`\n"
-    message += f"• Take Profit 2: `{signal_params.get('take_profit_2', 'N/A')}`\n"
-    message += f"• Take Profit 3: `{signal_params.get('take_profit_3', 'N/A')}`\n"
-    message += f"• Risk/Reward: `{signal_params.get('risk_reward_ratio', 'N/A')}`\n"
-    message += f"• Position Size: `{signal_params.get('position_size', 'N/A')}`\n"
-    
-    # Validation info
-    message += f"\n*✅ Validation:*\n"
-    message += f"• Confidence: `{validation.get('confidence', 0):.1%}`\n"
-    message += f"• Status: `{'VALID ✅' if validation.get('is_valid', False) else 'REJECTED ❌'}`\n"
-    
-    if validation.get('warnings'):
-        message += f"• Warnings: `{', '.join(validation['warnings'][:3])}`\n"
-    
-    # Market context if available
-    if 'adx_val' in signal_data:
-        message += f"\n*📈 Market Context:*\n"
-        message += f"• ADX: `{signal_data.get('adx_val', 0):.1f}`\n"
-        message += f"• Regime: `{'RANGING' if signal_data.get('ranging', True) else 'TRENDING'}`\n"
-    
-    if 'volatility' in signal_data:
-        message += f"• Volatility: `{signal_data.get('volatility', 0):.1f}%`\n"
-    
-    # Timestamps
-    current_time = datetime.now(timezone.utc)
-    message += f"\n*🕒 Timestamps:*\n"
-    message += f"• Signal Time: `{current_time.strftime('%H:%M UTC')}`\n"
-    
-    if 'valid_until' in signal_params:
-        valid_time = datetime.fromisoformat(signal_params['valid_until'].replace('Z', '+00:00'))
-        message += f"• Valid Until: `{valid_time.strftime('%H:%M UTC')}`\n"
-    
-    return message
-
 def detect_instrument_type(pair: str) -> str:
     """Detect instrument type from pair name"""
     pair = str(pair).upper()
@@ -457,6 +408,112 @@ def detect_instrument_type(pair: str) -> str:
         return 'CRYPTO'
     
     return 'FOREX'  # Default
+
+def normalize_action_name(action: str) -> str:
+    """Normalize action name to standard format"""
+    if not action:
+        return ''
+    
+    action = str(action).upper().strip()
+    
+    # Map to consistent naming - FIXED VERSION
+    if action in ['BUY', 'BUYING', 'LONG']:
+        return 'LONG'
+    elif action in ['SELL', 'SELLING', 'SHORT']:
+        return 'SHORT'
+    elif 'EXIT_LONG' in action or 'CLOSE_LONG' in action:
+        return 'EXIT_LONG'
+    elif 'EXIT_SHORT' in action or 'CLOSE_SHORT' in action:
+        return 'EXIT_SHORT'
+    else:
+        return action
+
+def format_telegram_message(signal_data: dict, validation: dict, 
+                           signal_params: dict) -> str:
+    """Format enhanced Telegram message - FIXED VERSION"""
+    
+    action = signal_data.get('action', '')
+    pair = signal_data.get('pair', '')
+    price = signal_data.get('price', '')
+    timeframe = signal_data.get('timeframe', '')
+    
+    # Normalize action for display
+    normalized_action = normalize_action_name(action)
+    
+    # Determine emoji and title - FIXED LOGIC
+    if 'EXIT' in normalized_action:
+        emoji = "🔴"
+        title = "EXIT SIGNAL"
+        direction_display = normalized_action.replace('EXIT_', '').title()
+    elif normalized_action == 'LONG':
+        emoji = "🟢"
+        title = "LONG ENTRY"
+        direction_display = "LONG"
+    elif normalized_action == 'SHORT':
+        emoji = "🔵"
+        title = "SHORT ENTRY"
+        direction_display = "SHORT"
+    else:
+        emoji = "⚪"
+        title = "TRADING SIGNAL"
+        direction_display = normalized_action
+    
+    message = f"{emoji} *{title}* {emoji}\n\n"
+    
+    # Basic info - FIXED: Use "Direction" instead of "Action"
+    message += f"*Instrument:* `{pair}`\n"
+    message += f"*Direction:* `{direction_display}`\n"
+    message += f"*Entry:* `{price}`\n"
+    message += f"*Timeframe:* `{timeframe}`\n"
+    
+    # Timeframe analysis
+    tf_calc = TimeframeCalculator()
+    tf_config = tf_calc.get_timeframe_config(timeframe)
+    tf_analysis = tf_calc.analyze_timeframe_quality(timeframe, signal_data.get('instrument_type', 'FOREX'))
+    
+    message += f"\n*⏰ Timeframe Analysis:*\n"
+    message += f"• Multiplier: `{tf_config.multiplier}x`\n"
+    message += f"• Optimal: `{'✅' if tf_analysis['is_optimal'] else '⚠️'}`\n"
+    message += f"• Valid for: `{tf_config.valid_for_hours}h`\n"
+    
+    # Signal parameters
+    if signal_params:
+        message += f"\n*📊 Signal Parameters:*\n"
+        message += f"• Stop Loss: `{signal_params.get('stop_loss', 'N/A')}`\n"
+        message += f"• Take Profit 1: `{signal_params.get('take_profit_1', 'N/A')}`\n"
+        message += f"• Take Profit 2: `{signal_params.get('take_profit_2', 'N/A')}`\n"
+        message += f"• Take Profit 3: `{signal_params.get('take_profit_3', 'N/A')}`\n"
+        message += f"• Risk/Reward: `{signal_params.get('risk_reward_ratio', 'N/A')}`\n"
+        message += f"• Position Size: `{signal_params.get('position_size', 'N/A')}`\n"
+    
+    # Validation info
+    message += f"\n*✅ Validation:*\n"
+    message += f"• Confidence: `{validation.get('confidence', 0):.1%}`\n"
+    message += f"• Status: `{'VALID ✅' if validation.get('is_valid', False) else 'REJECTED ❌'}`\n"
+    
+    if validation.get('warnings'):
+        warnings = validation['warnings'][:3]  # Show only first 3 warnings
+        message += f"• Warnings: `{', '.join(warnings)}`\n"
+    
+    # Market context if available
+    if 'adx_val' in signal_data:
+        message += f"\n*📈 Market Context:*\n"
+        message += f"• ADX: `{signal_data.get('adx_val', 0):.1f}`\n"
+        message += f"• Regime: `{'RANGING' if signal_data.get('ranging', True) else 'TRENDING'}`\n"
+    
+    if 'volatility' in signal_data:
+        message += f"• Volatility: `{signal_data.get('volatility', 0):.1f}%`\n"
+    
+    # Timestamps
+    current_time = datetime.now(timezone.utc)
+    message += f"\n*🕒 Timestamps:*\n"
+    message += f"• Signal Time: `{current_time.strftime('%H:%M UTC')}`\n"
+    
+    if 'valid_until' in signal_params:
+        valid_time = datetime.fromisoformat(signal_params['valid_until'].replace('Z', '+00:00'))
+        message += f"• Valid Until: `{valid_time.strftime('%H:%M UTC')}`\n"
+    
+    return message
 
 @app.route('/webhook', methods=['POST', 'GET'])
 def handle_webhook():
@@ -527,6 +584,9 @@ def handle_webhook():
         # Determine instrument type
         signal_data['instrument_type'] = detect_instrument_type(signal_data['pair'])
         
+        # FIXED: Normalize action name to ensure consistency
+        signal_data['action'] = normalize_action_name(signal_data['action'])
+        
         logger.info(f"Signal: {signal_data['pair']} {signal_data['action']} @ {signal_data.get('price', 0)} TF:{signal_data['timeframe']}")
         
         # Validate signal
@@ -581,7 +641,7 @@ def handle_webhook():
                         "timestamp": datetime.now(timezone.utc).isoformat()
                     }), 200
                 else:
-                    logger.error(f"❌ Telegram error: {response.status_code}")
+                    logger.error(f"❌ Telegram error: {response.status_code} - {response.text}")
                     return jsonify({"status": "telegram_error", "details": response.text}), 200
             else:
                 # Log rejected signal
@@ -635,14 +695,14 @@ def log_signal(signal_data: dict, validation: dict, parameters: dict):
 def health():
     return jsonify({
         "status": "operational",
-        "service": "Timeframe-Aware Trading Bot",
-        "version": "7.0",
+        "service": "Timeframe-Aware Trading Bot v7.1",
+        "version": "7.1",
         "mode": ALERT_MODE,
         "telegram_configured": bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID),
         "timestamp": datetime.now(timezone.utc).isoformat()
     }), 200
 
-@app.route('/test', methods=['POST'])
+@app.route('/test-signal', methods=['POST'])
 def test_signal():
     """Test endpoint for signal processing"""
     try:
@@ -665,6 +725,9 @@ def test_signal():
         if 'instrument_type' not in signal_data and 'pair' in signal_data:
             signal_data['instrument_type'] = detect_instrument_type(signal_data['pair'])
         
+        # Normalize action
+        signal_data['action'] = normalize_action_name(signal_data.get('action', ''))
+        
         # Validate
         validation = validator.validate_enhanced_signal(signal_data)
         
@@ -680,10 +743,66 @@ def test_signal():
         else:
             signal_params = {}
         
+        # Format message for preview
+        message = format_telegram_message(signal_data, validation, signal_params)
+        
         return jsonify({
             "signal_data": signal_data,
             "validation": validation,
-            "parameters": signal_params
+            "parameters": signal_params,
+            "message_preview": message[:500] + "..." if len(message) > 500 else message
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/debug', methods=['GET'])
+def debug_info():
+    """Debug endpoint to check configuration"""
+    return jsonify({
+        "telegram_token_set": bool(TELEGRAM_TOKEN),
+        "telegram_token_length": len(TELEGRAM_TOKEN) if TELEGRAM_TOKEN else 0,
+        "telegram_chat_id": TELEGRAM_CHAT_ID,
+        "alert_mode": ALERT_MODE,
+        "server_time": datetime.now(timezone.utc).isoformat(),
+        "telegram_api_test": "Run /test-telegram to check"
+    }), 200
+
+@app.route('/test-telegram', methods=['GET'])
+def test_telegram():
+    """Test Telegram connection"""
+    try:
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            return jsonify({"error": "Telegram not configured"}), 400
+        
+        # Test getMe
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe"
+        response = requests.get(url, timeout=5)
+        
+        if response.status_code != 200:
+            return jsonify({
+                "status": "error",
+                "telegram_api": "failed",
+                "error": response.text
+            }), 400
+        
+        # Test sendMessage
+        test_message = f"✅ Telegram Test\nTime: {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": test_message,
+            "parse_mode": "Markdown"
+        }
+        
+        send_response = requests.post(url, json=payload, timeout=5)
+        
+        return jsonify({
+            "status": "success",
+            "telegram_api": "connected",
+            "bot_info": response.json(),
+            "message_sent": send_response.status_code == 200,
+            "message_response": send_response.json() if send_response.status_code == 200 else send_response.text
         }), 200
         
     except Exception as e:
@@ -691,8 +810,8 @@ def test_signal():
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
-    logger.info(f"🚀 Starting Timeframe-Aware Trading Bot v7.0 on port {port}")
+    logger.info(f"🚀 Starting Timeframe-Aware Trading Bot v7.1 on port {port}")
     logger.info(f"🔧 Alert Mode: {ALERT_MODE}")
     logger.info(f"🤖 Telegram configured: {bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)}")
     
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
