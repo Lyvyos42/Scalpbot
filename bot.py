@@ -833,3 +833,11 @@ if __name__ == '__main__':
     logger.info(f"🤖 Telegram configured: {bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)}")
     
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+
+if __name__ == '__main__':
+    port = int(os.getenv('PORT', 5000))
+    logger.info(f"🚀 Starting Timeframe-Aware Trading Bot v7.1 on port {port}")
+    logger.info(f"🔧 Alert Mode: {ALERT_MODE}")
+    logger.info(f"🤖 Telegram configured: {bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)}")
+    
+    # app.run(...)  # Removed for production; handled by Gunicorn
