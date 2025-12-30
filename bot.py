@@ -83,14 +83,15 @@ class TelegramNotifier:
             direction_text = "BUY/LONG" if direction == "LONG" else "SELL/SHORT"
             
             # Format based on symbol type
-            if any(x in symbol.upper() for x in ["XAU", "XAG"]):
+            symbol_upper = symbol.upper().replace("/", "")
+            if any(x in symbol_upper for x in ["XAU", "XAG"]):
                 # Commodities - show 2 decimal places
                 entry_fmt = f"{entry:.2f}"
                 sl_fmt = f"{sl:.2f}"
                 tp1_fmt = f"{tp1:.2f}"
                 tp2_fmt = f"{tp2:.2f}"
                 tp3_fmt = f"{tp3:.2f}"
-            elif any(x in symbol.upper() for x in ["BTC", "ETH", "SOL"]):
+            elif any(x in symbol_upper for x in ["BTC", "ETH", "SOL"]):
                 # Crypto - show 2 decimal places
                 entry_fmt = f"{entry:.2f}"
                 sl_fmt = f"{sl:.2f}"
@@ -131,65 +132,64 @@ class TelegramNotifier:
             return False
 
 class DynamicRiskManager:
-    """Dynamic risk management across timeframes and markets"""
+    """Dynamic risk management with REALISTIC calculations"""
     
     def __init__(self):
-        # Base stop loss in pips for each timeframe
+        # REALISTIC stop loss in pips/points for each timeframe
         self.timeframe_stops = {
-            TimeFrame.M1: 2,   TimeFrame.M3: 3,   TimeFrame.M5: 5,
-            TimeFrame.M15: 8,  TimeFrame.M30: 12, TimeFrame.H1: 15,
-            TimeFrame.H4: 25,  TimeFrame.D1: 40
+            TimeFrame.M1: {"pips": 2, "crypto_points": 5, "gold_points": 2},
+            TimeFrame.M3: {"pips": 3, "crypto_points": 10, "gold_points": 3},
+            TimeFrame.M5: {"pips": 5, "crypto_points": 15, "gold_points": 5},
+            TimeFrame.M15: {"pips": 8, "crypto_points": 25, "gold_points": 8},
+            TimeFrame.M30: {"pips": 12, "crypto_points": 40, "gold_points": 12},
+            TimeFrame.H1: {"pips": 15, "crypto_points": 60, "gold_points": 15},
+            TimeFrame.H4: {"pips": 25, "crypto_points": 100, "gold_points": 25},
+            TimeFrame.D1: {"pips": 40, "crypto_points": 200, "gold_points": 40}
         }
         
         # Risk/Reward ratios for each timeframe
         self.timeframe_rr_ratios = {
-            TimeFrame.M1: [1.0, 1.5, 2.0],   TimeFrame.M3: [1.0, 2.0, 3.0],
-            TimeFrame.M5: [1.5, 2.5, 3.5],   TimeFrame.M15: [2.0, 3.0, 4.0],
-            TimeFrame.M30: [2.0, 3.0, 4.0],  TimeFrame.H1: [2.5, 3.5, 5.0],
-            TimeFrame.H4: [3.0, 4.0, 6.0],   TimeFrame.D1: [3.0, 5.0, 8.0]
-        }
-        
-        # Symbol-specific configurations
-        self.symbol_configs = {
-            "ETHUSD": {
-                "pip_size": 0.01,  # 1 pip = $0.01 for ETHUSD
-                "min_stop_pips": 10,  # Minimum stop loss in pips
-                "volatility_factor": 1.5  # ETH is more volatile
-            },
-            "BTCUSD": {
-                "pip_size": 0.1,  # 1 pip = $0.10 for BTCUSD
-                "min_stop_pips": 20,
-                "volatility_factor": 2.0
-            },
-            "XAUUSD": {
-                "pip_size": 0.01,  # 1 pip = $0.01 for gold
-                "min_stop_pips": 15,
-                "volatility_factor": 1.2
-            },
-            "EURCAD": {
-                "pip_size": 0.0001,  # Standard forex
-                "min_stop_pips": 5,
-                "volatility_factor": 1.0
-            }
+            TimeFrame.M1: [1.0, 1.5, 2.0],
+            TimeFrame.M3: [1.0, 2.0, 3.0],
+            TimeFrame.M5: [1.5, 2.5, 3.5],
+            TimeFrame.M15: [2.0, 3.0, 4.0],
+            TimeFrame.M30: [2.0, 3.0, 4.0],
+            TimeFrame.H1: [2.5, 3.5, 5.0],
+            TimeFrame.H4: [3.0, 4.0, 6.0],
+            TimeFrame.D1: [3.0, 5.0, 8.0]
         }
     
+    def get_stop_distance(self, symbol: str, timeframe: TimeFrame) -> float:
+        """Get realistic stop distance based on symbol and timeframe"""
+        symbol_upper = symbol.upper().replace("/", "")
+        config = self.timeframe_stops.get(timeframe, {"pips": 10, "crypto_points": 30, "gold_points": 10})
+        
+        if "BTC" in symbol_upper or "ETH" in symbol_upper or "SOL" in symbol_upper:
+            # For crypto, return points (dollars)
+            return config["crypto_points"]
+        elif "XAU" in symbol_upper or "XAG" in symbol_upper:
+            # For gold/silver, return points (dollars)
+            return config["gold_points"]
+        else:
+            # For forex, return pips
+            return config["pips"]
+    
     def calculate_pip_size(self, symbol: str) -> float:
-        """Calculate pip size based on symbol"""
+        """Calculate pip size based on symbol - SIMPLIFIED"""
         symbol_upper = symbol.upper().replace("/", "")
         
-        # Check if we have specific config
-        if symbol_upper in self.symbol_configs:
-            return self.symbol_configs[symbol_upper]["pip_size"]
-        
-        # Default configurations
         if "JPY" in symbol_upper:
             return 0.01
         elif "XAU" in symbol_upper or "XAG" in symbol_upper:
-            return 0.01
-        elif any(crypto in symbol_upper for crypto in ["BTC", "ETH", "SOL"]):
-            return 0.01  # Updated: Most cryptos use 0.01 pip size
+            return 0.01  # Gold: 0.01 = $0.01
+        elif "BTC" in symbol_upper:
+            return 1.0  # Bitcoin: 1.0 = $1.00
+        elif "ETH" in symbol_upper:
+            return 0.1  # Ethereum: 0.1 = $0.10
+        elif "SOL" in symbol_upper:
+            return 0.01  # Solana: 0.01 = $0.01
         else:
-            return 0.0001
+            return 0.0001  # Standard forex
     
     def calculate_stop_loss(self, 
                            symbol: str,
@@ -197,48 +197,42 @@ class DynamicRiskManager:
                            direction: str,
                            timeframe: TimeFrame,
                            market_type: MarketType) -> Dict:
-        """Calculate dynamic stop loss"""
-        base_stop = self.timeframe_stops.get(timeframe, 10)
+        """Calculate realistic stop loss"""
+        # Get stop distance in appropriate units
+        stop_distance_units = self.get_stop_distance(symbol, timeframe)
         
-        # Apply market-specific adjustments
-        symbol_upper = symbol.upper().replace("/", "")
-        if symbol_upper in self.symbol_configs:
-            volatility_factor = self.symbol_configs[symbol_upper]["volatility_factor"]
-            min_stop_pips = self.symbol_configs[symbol_upper]["min_stop_pips"]
-        else:
-            if market_type == MarketType.CRYPTO:
-                volatility_factor = 2.0
-                min_stop_pips = 15
-            elif market_type == MarketType.COMMODITIES:
-                volatility_factor = 1.2
-                min_stop_pips = 10
-            else:  # FOREX
-                volatility_factor = 1.0
-                min_stop_pips = 5
-        
-        stop_pips = base_stop * volatility_factor
-        
-        # Ensure minimum stop pips
-        stop_pips = max(stop_pips, min_stop_pips)
-        
-        pip_size = self.calculate_pip_size(symbol)
-        stop_distance = stop_pips * pip_size
-        
-        # For crypto, ensure reasonable stop distance
-        if market_type == MarketType.CRYPTO and stop_distance < entry_price * 0.005:  # At least 0.5%
-            stop_distance = entry_price * 0.005
-            stop_pips = stop_distance / pip_size
+        # Convert to price distance
+        if market_type == MarketType.CRYPTO:
+            # For crypto, stop_distance_units is already in dollars
+            stop_price_distance = stop_distance_units
+            stop_pips = stop_distance_units  # For crypto, "pips" are actually dollars
+        elif market_type == MarketType.COMMODITIES:
+            # For commodities, stop_distance_units is in dollars
+            stop_price_distance = stop_distance_units
+            stop_pips = stop_distance_units
+        else:  # FOREX
+            # For forex, stop_distance_units is in pips
+            pip_size = self.calculate_pip_size(symbol)
+            stop_price_distance = stop_distance_units * pip_size
+            stop_pips = stop_distance_units
         
         # Calculate stop price
         if direction.upper() == "SHORT":
-            stop_price = entry_price + stop_distance
+            stop_price = entry_price + stop_price_distance
         else:
-            stop_price = entry_price - stop_distance
+            stop_price = entry_price - stop_price_distance
+        
+        # Round appropriately
+        symbol_upper = symbol.upper().replace("/", "")
+        if any(x in symbol_upper for x in ["XAU", "BTC", "ETH"]):
+            stop_price = round(stop_price, 2)
+        else:
+            stop_price = round(stop_price, 5)
         
         return {
-            "stop_loss": round(stop_price, 2 if "XAU" in symbol_upper or "BTC" in symbol_upper or "ETH" in symbol_upper else 5),
+            "stop_loss": stop_price,
             "stop_pips": round(stop_pips, 1),
-            "stop_distance": stop_distance
+            "stop_distance": stop_price_distance
         }
     
     def calculate_take_profits(self,
@@ -246,32 +240,39 @@ class DynamicRiskManager:
                               stop_pips: float,
                               direction: str,
                               timeframe: TimeFrame,
-                              symbol: str) -> List[Dict]:
-        """Calculate three take-profit levels"""
+                              symbol: str,
+                              market_type: MarketType) -> List[Dict]:
+        """Calculate realistic take-profit levels"""
         rr_ratios = self.timeframe_rr_ratios.get(timeframe, [1.0, 2.0, 3.0])
-        pip_size = self.calculate_pip_size(symbol)
         
         tp_levels = []
         for i, ratio in enumerate(rr_ratios):
-            tp_pips = stop_pips * ratio
-            tp_distance = tp_pips * pip_size
+            if market_type in [MarketType.CRYPTO, MarketType.COMMODITIES]:
+                # For crypto and commodities, stop_pips is in dollars
+                tp_distance = stop_pips * ratio
+            else:
+                # For forex, convert pips to price
+                pip_size = self.calculate_pip_size(symbol)
+                tp_distance = stop_pips * ratio * pip_size
             
             if direction.upper() == "SHORT":
                 tp_price = entry_price - tp_distance
             else:
                 tp_price = entry_price + tp_distance
             
-            # Round based on symbol type
+            # Round appropriately
             symbol_upper = symbol.upper().replace("/", "")
             if any(x in symbol_upper for x in ["XAU", "BTC", "ETH"]):
                 tp_price = round(tp_price, 2)
+                tp_pips = round(stop_pips * ratio, 1)
             else:
                 tp_price = round(tp_price, 5)
+                tp_pips = round(stop_pips * ratio, 1)
             
             tp_levels.append({
                 "level": i + 1,
                 "price": tp_price,
-                "pips": round(tp_pips, 1),
+                "pips": tp_pips,
                 "rr_ratio": ratio,
                 "distance": tp_distance
             })
@@ -279,7 +280,7 @@ class DynamicRiskManager:
         return tp_levels
 
 class TradingBot:
-    """Trading bot that only sends signals to Telegram"""
+    """Trading bot with REALISTIC calculations"""
     
     def __init__(self, telegram_token: str, telegram_chat_id: str):
         self.risk_manager = DynamicRiskManager()
@@ -337,7 +338,7 @@ class TradingBot:
                             direction: str,
                             entry_price: float,
                             timeframe: TimeFrame) -> Dict:
-        """Calculate complete trade plan"""
+        """Calculate complete trade plan with REALISTIC values"""
         market_profile = self.get_market_profile(symbol)
         
         stop_data = self.risk_manager.calculate_stop_loss(
@@ -353,11 +354,9 @@ class TradingBot:
             stop_pips=stop_data["stop_pips"],
             direction=direction,
             timeframe=timeframe,
-            symbol=symbol
+            symbol=symbol,
+            market_type=market_profile.market_type
         )
-        
-        # Fixed position size
-        position_size = 1.0  # Standard lot
         
         trade_plan = {
             "symbol": symbol,
@@ -367,7 +366,7 @@ class TradingBot:
             "stop_loss": stop_data["stop_loss"],
             "stop_pips": stop_data["stop_pips"],
             "take_profits": tp_levels,
-            "position_size": position_size,
+            "position_size": 1.0,
             "calculated_at": datetime.now()
         }
         
@@ -420,59 +419,62 @@ class TradingBot:
     def display_trade_plan(self, trade_plan: Dict):
         """Display formatted trade plan for debugging"""
         print("\n" + "="*80)
-        print("📊 TRADE SIGNAL DETAILS (Debug)")
+        print("📊 TRADE SIGNAL DETAILS")
         print("="*80)
         print(f"Symbol: {trade_plan['symbol']}")
         print(f"Direction: {trade_plan['direction']}")
         print(f"Timeframe: {trade_plan['timeframe']}")
         print(f"Entry Price: {trade_plan['entry_price']}")
         print(f"Stop Loss: {trade_plan['stop_loss']}")
-        print(f"Stop Pips: {trade_plan['stop_pips']:.1f}")
+        
+        # Display stop in appropriate units
+        symbol_upper = trade_plan['symbol'].upper().replace("/", "")
+        if any(x in symbol_upper for x in ["BTC", "ETH", "SOL", "XAU", "XAG"]):
+            print(f"Stop Distance: ${trade_plan['stop_pips']:.1f}")
+        else:
+            print(f"Stop Pips: {trade_plan['stop_pips']:.1f}")
         
         print("\n🎯 TAKE PROFIT LEVELS:")
         print("-"*40)
         for tp in trade_plan["take_profits"]:
-            print(f"TP{tp['level']}: {tp['price']} ({tp['pips']:.1f} pips, {tp['rr_ratio']}:1 RR)")
+            if any(x in symbol_upper for x in ["BTC", "ETH", "SOL", "XAU", "XAG"]):
+                print(f"TP{tp['level']}: {tp['price']:.2f} (${tp['pips']:.1f}, {tp['rr_ratio']}:1 RR)")
+            else:
+                print(f"TP{tp['level']}: {tp['price']:.5f} ({tp['pips']:.1f} pips, {tp['rr_ratio']}:1 RR)")
         
         print("="*80)
 
 def main():
-    """Main function - sends CORRECTED signals based on TradingView entries"""
+    """Main function - sends REALISTIC signals"""
     
     # Your Telegram Credentials
     TELEGRAM_BOT_TOKEN = "8276762810:AAFR_9TxacZPIhx_n3ohc_tdDgp6p1WQFOI"
     TELEGRAM_CHAT_ID = "-1003587493551"
     
     print("\n" + "="*80)
-    print("🤖 QUANTUM SCALPER PRO - CORRECTED ENTRIES")
+    print("🤖 QUANTUM SCALPER PRO - REALISTIC CALCULATIONS")
     print("="*80)
-    print("Fixing entry prices to match TradingView strategy...")
+    print("Fixing unrealistic stop loss and take profit calculations...")
     print("="*80)
     
     # Initialize bot
     bot = TradingBot(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
     
-    print("\n📡 Sending CORRECTED Signals to Telegram...")
+    print("\n📡 Sending REALISTIC Signals to Telegram...")
     print("-"*40)
     
-    # CORRECTED SIGNALS BASED ON TRADINGVIEW
-    # Using actual TradingView strategy entries from your images
+    # REALISTIC signals with proper calculations
     signals = [
-        # Signal 1: EURCAD Short (3-minute) - From original example
-        # Original: 1.61159
+        # Signal 1: EURCAD Short (3-minute)
         ("EURCAD", "SHORT", 1.61159, "3M"),
         
-        # Signal 2: BTCUSD Long (1-hour) - Check your TradingView for correct entry
-        # Current price shows ~87,832 but check strategy entry
+        # Signal 2: BTCUSD Long (1-hour) - REALISTIC stop
         ("BTCUSD", "LONG", 87832.0, "1H"),
         
-        # Signal 3: ETHUSD Short (15-minute) - CORRECTED ENTRY
-        # WRONG: 2972.88888 (from old Telegram)
-        # CORRECT: 2985.60 (from TradingView 15-minute chart)
+        # Signal 3: ETHUSD Short (15-minute) - CORRECTED entry
         ("ETHUSD", "SHORT", 2985.60, "15M"),
         
-        # Signal 4: XAUUSD Long (4-hour) - Check your TradingView for correct entry
-        # Current shows ~1835.0 but check strategy entry
+        # Signal 4: XAUUSD Long (4-hour) - REALISTIC stop
         ("XAUUSD", "LONG", 1835.0, "4H"),
     ]
     
@@ -493,36 +495,37 @@ def main():
         if i < len(signals):
             time.sleep(3)
     
-    # Show expected calculations for ETHUSD
+    # Show what to expect
     print("\n" + "="*80)
-    print("📊 EXPECTED ETHUSD CALCULATIONS (15-minute Short):")
+    print("📊 EXPECTED REALISTIC CALCULATIONS:")
     print("="*80)
-    print(f"Entry Price: 2985.60")
-    print(f"Direction: SHORT")
-    print(f"Timeframe: 15M")
-    print(f"Base Stop (15M): 8 pips")
-    print(f"ETH Volatility Factor: 1.5x")
-    print(f"Calculated Stop: 8 × 1.5 = 12 pips")
-    print(f"Pip Size (ETHUSD): 0.01")
-    print(f"Stop Distance: 12 × 0.01 = 0.12")
-    print(f"Stop Loss: 2985.60 + 0.12 = 2985.72")
-    print(f"RR Ratios (15M): 2.0:1, 3.0:1, 4.0:1")
-    print(f"TP1: 2985.60 - (12 × 2.0 × 0.01) = 2985.60 - 0.24 = 2985.36")
-    print(f"TP2: 2985.60 - (12 × 3.0 × 0.01) = 2985.60 - 0.36 = 2985.24")
-    print(f"TP3: 2985.60 - (12 × 4.0 × 0.01) = 2985.60 - 0.48 = 2985.12")
+    print("1. EURCAD (3M Short):")
+    print("   - Stop: 3 pips = 1.61159 + 0.0003 = 1.61189")
+    print("   - TP1: 3 pips = 1.61159 - 0.0003 = 1.61129 (1:1 RR)")
+    print("   - TP2: 6 pips = 1.61159 - 0.0006 = 1.61099 (2:1 RR)")
+    print("   - TP3: 9 pips = 1.61159 - 0.0009 = 1.61069 (3:1 RR)")
+    
+    print("\n2. BTCUSD (1H Long):")
+    print("   - Stop: $60 = 87832.0 - 60 = 87772.0")
+    print("   - TP1: $150 = 87832.0 + 150 = 87982.0 (2.5:1 RR)")
+    print("   - TP2: $210 = 87832.0 + 210 = 88042.0 (3.5:1 RR)")
+    print("   - TP3: $300 = 87832.0 + 300 = 88132.0 (5:1 RR)")
+    
+    print("\n3. ETHUSD (15M Short):")
+    print("   - Stop: $25 = 2985.60 + 25 = 3010.60")
+    print("   - TP1: $50 = 2985.60 - 50 = 2935.60 (2:1 RR)")
+    print("   - TP2: $75 = 2985.60 - 75 = 2910.60 (3:1 RR)")
+    print("   - TP3: $100 = 2985.60 - 100 = 2885.60 (4:1 RR)")
+    
+    print("\n4. XAUUSD (4H Long):")
+    print("   - Stop: $25 = 1835.0 - 25 = 1810.0")
+    print("   - TP1: $75 = 1835.0 + 75 = 1910.0 (3:1 RR)")
+    print("   - TP2: $100 = 1835.0 + 100 = 1935.0 (4:1 RR)")
+    print("   - TP3: $150 = 1835.0 + 150 = 1985.0 (6:1 RR)")
     print("="*80)
     
     print(f"\n📊 RESULTS: {success_count}/{len(signals)} signals sent successfully")
-    print("📱 Check your Telegram channel for corrected signals")
-    print("="*80)
-    
-    # Show what was fixed
-    print("\n🔧 CORRECTIONS MADE:")
-    print("-"*40)
-    print("1. ETHUSD entry corrected from 2972.89 to 2985.60")
-    print("2. All stop losses and take profits recalculated")
-    print("3. Proper pip sizes for each symbol type")
-    print("4. Market-specific volatility adjustments")
+    print("📱 Check your Telegram channel for REALISTIC signals")
     print("="*80)
     
     # Keep bot running briefly
