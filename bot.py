@@ -462,8 +462,10 @@ def format_telegram_message(signal_data: dict, validation: dict,
     
     # Basic info - FIXED: Use "Direction" instead of "Action"
     message += f"*Instrument:* `{pair}`\n"
+    message += f"*Type:* `{signal_data.get('instrument_type', 'N/A')}`\n"
     message += f"*Direction:* `{direction_display}`\n"
     message += f"*Entry:* `{price}`\n"
+    message += f"*Reason:* `{signal_data.get('reason', 'N/A')}`\n"
     message += f"*Timeframe:* `{timeframe}`\n"
     
     # Timeframe analysis
@@ -477,6 +479,7 @@ def format_telegram_message(signal_data: dict, validation: dict,
     message += f"• Valid for: `{tf_config.valid_for_hours}h`\n"
     
     # Signal parameters
+    decimals = signal_params.get('price_decimals', 2)
     if signal_params:
         message += f"\n*📊 Signal Parameters:*\n"
         message += f"• Stop Loss: `{signal_params.get('stop_loss', 'N/A')}`\n"
@@ -484,7 +487,17 @@ def format_telegram_message(signal_data: dict, validation: dict,
         message += f"• Take Profit 2: `{signal_params.get('take_profit_2', 'N/A')}`\n"
         message += f"• Take Profit 3: `{signal_params.get('take_profit_3', 'N/A')}`\n"
         message += f"• Risk/Reward: `{signal_params.get('risk_reward_ratio', 'N/A')}`\n"
-        message += f"• Position Size: `{signal_params.get('position_size', 'N/A')}`\n"
+        message += f"• Suggested Position Size: `{signal_params.get('position_size', 'N/A')}`\n"
+    
+    # Strategy-specific info
+    message += f"\n*🛠 Strategy Info:*\n"
+    message += f"• ATR: `{signal_data.get('atr', 0):.4f}`\n"
+    message += f"• Adaptive Multiplier: `{signal_data.get('adaptive_mult', 0):.1f}`\n"
+    message += f"• Avg Recent Profit: `{signal_data.get('avg_profit', 'N/A')}`\n"
+    if 'sl_price' in signal_data:
+        message += f"• Strategy SL: `{round(signal_data.get('sl_price', 0), decimals)}`\n"
+        message += f"• Strategy TP: `{round(signal_data.get('tp_price', 0), decimals)}`\n"
+        message += f"• Strategy Position Size: `{signal_data.get('position_size', 'N/A')}`\n"
     
     # Validation info
     message += f"\n*✅ Validation:*\n"
@@ -503,6 +516,11 @@ def format_telegram_message(signal_data: dict, validation: dict,
     
     if 'volatility' in signal_data:
         message += f"• Volatility: `{signal_data.get('volatility', 0):.1f}%`\n"
+    
+    if 'bb_upper' in signal_data:
+        message += f"• BB Upper: `{round(signal_data.get('bb_upper', 0), decimals)}`\n"
+        message += f"• BB Middle: `{round(signal_data.get('bb_middle', 0), decimals)}`\n"
+        message += f"• BB Lower: `{round(signal_data.get('bb_lower', 0), decimals)}`\n"
     
     # Timestamps
     current_time = datetime.now(timezone.utc)
