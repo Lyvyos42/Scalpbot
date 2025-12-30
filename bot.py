@@ -1,273 +1,730 @@
-import os
-import re
-import json
-from datetime import datetime, timezone
-from flask import Flask, request, jsonify
-import requests
+import time
+import logging
+import pandas as pd
+import numpy as np
+from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+import talib
+from enum import Enum
 
-app = Flask(__name__)
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('trading_bot.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-# ========= CONFIGURATION =========
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '').strip()
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '').strip()
-# =================================
+class MarketType(Enum):
+    FOREX = "FOREX"
+    CRYPTO = "CRYPTO"
+    STOCKS = "STOCKS"
+    COMMODITIES = "COMMODITIES"
+    INDICES = "INDICES"
 
-def log(msg):
-    """Log to Railway logs"""
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+class TimeFrame(Enum):
+    M1 = "1M"
+    M3 = "3M"
+    M5 = "5M"
+    M15 = "15M"
+    M30 = "30M"
+    H1 = "1H"
+    H4 = "4H"
+    D1 = "1D"
+    W1 = "1W"
+    MN1 = "1MN"
 
-def detect_instrument_type(pair):
-    """Detect instrument type"""
-    pair = str(pair).upper()
-    if any(idx in pair for idx in ['GER30', 'NAS100', 'SPX500', 'US30', 'UK100']):
-        return 'indices'
-    elif any(comm in pair for comm in ['XAU', 'GOLD', 'XAG', 'SILVER', 'OIL']):
-        return 'commodities'
-    else:
-        return 'forex'
-
-def calculate_tp_sl(entry_price, direction, instrument_type):
-    """Calculate TP/SL levels"""
-    try:
-        entry = float(entry_price)
-        
-        # Risk parameters
-        if instrument_type == 'forex':
-            pip = 0.0001
-            if direction == 'LONG':
-                tp1 = entry + (15 * pip)
-                tp2 = entry + (30 * pip)
-                tp3 = entry + (50 * pip)
-                sl = entry - (20 * pip)
-            else:
-                tp1 = entry - (15 * pip)
-                tp2 = entry - (30 * pip)
-                tp3 = entry - (50 * pip)
-                sl = entry + (20 * pip)
-                
-        elif instrument_type == 'indices':
-            if direction == 'LONG':
-                tp1 = entry + 30
-                tp2 = entry + 60
-                tp3 = entry + 100
-                sl = entry - 40
-            else:
-                tp1 = entry - 30
-                tp2 = entry - 60
-                tp3 = entry - 100
-                sl = entry + 40
-                
-        else:  # commodities
-            pip = 0.01
-            if direction == 'LONG':
-                tp1 = entry + (50 * pip)
-                tp2 = entry + (100 * pip)
-                tp3 = entry + (150 * pip)
-                sl = entry - (75 * pip)
-            else:
-                tp1 = entry - (50 * pip)
-                tp2 = entry - (100 * pip)
-                tp3 = entry - (150 * pip)
-                sl = entry + (75 * pip)
-        
-        # Format based on instrument
-        if instrument_type == 'forex':
-            return f"{tp1:.5f}", f"{tp2:.5f}", f"{tp3:.5f}", f"{sl:.5f}"
-        elif instrument_type == 'indices':
-            return f"{tp1:,.0f}", f"{tp2:,.0f}", f"{tp3:,.0f}", f"{sl:,.0f}"
-        else:
-            return f"{tp1:.2f}", f"{tp2:.2f}", f"{tp3:.2f}", f"{sl:.2f}"
-        
-    except Exception as e:
-        log(f"TP/SL calculation error: {e}")
-        return 'N/A', 'N/A', 'N/A', 'N/A'
-
-def parse_tradingview_text(raw_text):
-    """Parse TradingView's plain text format"""
-    log(f"Parsing text: {raw_text}")
+@dataclass
+class MarketProfile:
+    """Market-specific volatility and characteristics"""
+    symbol: str
+    market_type: MarketType
+    avg_daily_range: float  # Average Daily Range in pips/points
+    avg_true_range: float   # Current ATR
+    volatility_rank: float  # 0-100 volatility ranking
+    spread: float          # Typical spread
+    pip_value: float       # Value of 1 pip in account currency
+    lot_size: float = 100000  # Standard lot size
     
-    result = {
-        'pair': 'N/A',
-        'price': 'N/A', 
-        'action': 'N/A',
-        'timeframe': 'N/A'
-    }
-    
-    try:
-        text = raw_text.strip()
-        
-        # Format: "PAIR ACTION @ PRICE on TIMEFRAME"
-        if '@' in text:
-            left_part, right_part = text.split('@', 1)
-            
-            # Parse left: "PAIR ACTION"
-            left_parts = left_part.strip().split()
-            if len(left_parts) >= 2:
-                result['pair'] = left_parts[0].upper()
-                result['action'] = left_parts[1].upper()
-            
-            # Parse right: "PRICE on TIMEFRAME"
-            if 'on' in right_part:
-                price_part, timeframe_part = right_part.split('on', 1)
-                result['price'] = price_part.strip()
-                result['timeframe'] = timeframe_part.strip()
-            else:
-                result['price'] = right_part.strip()
-                
-        # Clean action
-        action_map = {'BUY': 'LONG', 'SELL': 'SHORT'}
-        if result['action'] in action_map:
-            result['action'] = action_map[result['action']]
-        
-        # Format price
-        try:
-            price_float = float(result['price'])
-            if detect_instrument_type(result['pair']) == 'indices':
-                result['price'] = f"{int(price_float):,}"
-            elif len(result['pair']) == 6:  # Forex
-                result['price'] = f"{price_float:.5f}"
-        except:
-            pass
-            
-        log(f"Parsed result: {result}")
-        return result
-        
-    except Exception as e:
-        log(f"Text parsing error: {e}")
-        return result
+    def get_timeframe_multiplier(self, tf: TimeFrame) -> float:
+        """Get volatility multiplier for specific timeframe"""
+        multipliers = {
+            TimeFrame.M1: 0.2,
+            TimeFrame.M3: 0.3,
+            TimeFrame.M5: 0.4,
+            TimeFrame.M15: 0.6,
+            TimeFrame.M30: 0.8,
+            TimeFrame.H1: 1.0,
+            TimeFrame.H4: 1.5,
+            TimeFrame.D1: 2.0,
+            TimeFrame.W1: 3.0,
+            TimeFrame.MN1: 4.0
+        }
+        return multipliers.get(tf, 1.0)
 
-@app.route('/webhook', methods=['POST', 'GET'])
-def handle_webhook():
-    """Handle TradingView webhooks"""
-    log("=== WEBHOOK CALLED ===")
+@dataclass
+class TradeSignal:
+    """Trading signal with dynamic parameters"""
+    symbol: str
+    direction: str  # "LONG" or "SHORT"
+    entry_price: float
+    signal_strength: float  # 0-100
+    confidence: float       # 0-1
+    timestamp: datetime
+    indicators: Dict = field(default_factory=dict)
     
-    # Log request details
-    log(f"Method: {request.method}")
-    log(f"Content-Type: {request.content_type}")
+class DynamicRiskManager:
+    """Dynamic risk management across timeframes and markets"""
     
-    # GET requests
-    if request.method == 'GET':
-        return jsonify({"status": "ready"}), 200
+    def __init__(self):
+        self.timeframe_config = {
+            TimeFrame.M1: {"base_stop_pips": 3, "rr_ratios": [1.0, 2.0, 3.0]},
+            TimeFrame.M3: {"base_stop_pips": 5, "rr_ratios": [1.5, 2.5, 3.5]},
+            TimeFrame.M5: {"base_stop_pips": 8, "rr_ratios": [1.5, 2.5, 3.5]},
+            TimeFrame.M15: {"base_stop_pips": 10, "rr_ratios": [2.0, 3.0, 4.0]},
+            TimeFrame.M30: {"base_stop_pips": 15, "rr_ratios": [2.0, 3.0, 4.0]},
+            TimeFrame.H1: {"base_stop_pips": 20, "rr_ratios": [2.5, 3.5, 5.0]},
+            TimeFrame.H4: {"base_stop_pips": 30, "rr_ratios": [3.0, 4.0, 6.0]},
+            TimeFrame.D1: {"base_stop_pips": 50, "rr_ratios": [3.0, 5.0, 8.0]},
+            TimeFrame.W1: {"base_stop_pips": 100, "rr_ratios": [4.0, 6.0, 10.0]},
+            TimeFrame.MN1: {"base_stop_pips": 200, "rr_ratios": [5.0, 8.0, 13.0]}
+        }
+        
+        self.market_volatility_adjustments = {
+            MarketType.FOREX: 1.0,
+            MarketType.CRYPTO: 2.0,
+            MarketType.STOCKS: 0.8,
+            MarketType.COMMODITIES: 1.2,
+            MarketType.INDICES: 1.5
+        }
     
-    # POST requests
-    try:
-        # Get raw data
-        raw_data = request.get_data(as_text=True)
-        log(f"Raw data: {raw_data}")
+    def calculate_dynamic_stop_loss(self, 
+                                   market_profile: MarketProfile,
+                                   timeframe: TimeFrame,
+                                   entry_price: float,
+                                   direction: str) -> Dict:
+        """
+        Calculate dynamic stop loss based on market conditions and timeframe
+        """
+        # Base configuration for timeframe
+        config = self.timeframe_config[timeframe]
+        base_stop = config["base_stop_pips"]
         
-        # Parse data
-        parsed_data = {}
-        if 'application/json' in str(request.content_type):
-            try:
-                parsed_data = request.get_json(force=True)
-            except:
-                parsed_data = parse_tradingview_text(raw_data)
-        else:
-            parsed_data = parse_tradingview_text(raw_data)
+        # Adjust for market volatility
+        volatility_factor = self.market_volatility_adjustments.get(
+            market_profile.market_type, 1.0
+        )
         
-        # Extract fields
-        pair = parsed_data.get('pair', 'N/A')
-        price = parsed_data.get('price', 'N/A')
-        action = parsed_data.get('action', 'N/A')
-        timeframe = parsed_data.get('timeframe', 'N/A')
+        # Adjust for current ATR
+        atr_factor = market_profile.avg_true_range / market_profile.avg_daily_range * 20
         
-        log(f"Extracted: {pair} | {price} | {action} | {timeframe}")
+        # Calculate final stop loss in pips
+        stop_pips = base_stop * volatility_factor * atr_factor
         
-        # Send to Telegram
-        if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID and pair != 'N/A':
-            # Format signal
-            if action in ['LONG', 'BUY']:
-                signal = f"🟢 *ENTRY SIGNAL* 🟢\n\n"
-                signal += f"• *PAIR*: `{pair}`\n"
-                signal += f"• *DIRECTION*: `LONG`\n"
-                signal += f"• *ENTRY*: `{price}`\n"
-                
-                # Calculate TP/SL
-                try:
-                    price_clean = float(price.replace(',', ''))
-                    instrument = detect_instrument_type(pair)
-                    tp1, tp2, tp3, sl = calculate_tp_sl(price_clean, 'LONG', instrument)
-                    
-                    signal += f"• *STOP LOSS*: `{sl}`\n"
-                    signal += f"• *TAKE PROFIT 1*: `{tp1}`\n"
-                    signal += f"• *TAKE PROFIT 2*: `{tp2}`\n"
-                    signal += f"• *TAKE PROFIT 3*: `{tp3}`\n"
-                except:
-                    pass
-                    
-            elif action in ['SHORT', 'SELL']:
-                signal = f"🔵 *ENTRY SIGNAL* 🔵\n\n"
-                signal += f"• *PAIR*: `{pair}`\n"
-                signal += f"• *DIRECTION*: `SHORT`\n"
-                signal += f"• *ENTRY*: `{price}`\n"
-                
-                # Calculate TP/SL
-                try:
-                    price_clean = float(price.replace(',', ''))
-                    instrument = detect_instrument_type(pair)
-                    tp1, tp2, tp3, sl = calculate_tp_sl(price_clean, 'SHORT', instrument)
-                    
-                    signal += f"• *STOP LOSS*: `{sl}`\n"
-                    signal += f"• *TAKE PROFIT 1*: `{tp1}`\n"
-                    signal += f"• *TAKE PROFIT 2*: `{tp2}`\n"
-                    signal += f"• *TAKE PROFIT 3*: `{tp3}`\n"
-                except:
-                    pass
-            else:
-                signal = f"⚠️ *SIGNAL* ⚠️\n\n"
-                signal += f"• *PAIR*: `{pair}`\n"
-                signal += f"• *ACTION*: `{action}`\n"
-                signal += f"• *PRICE*: `{price}`\n"
+        # Apply market-specific adjustments
+        if market_profile.market_type == MarketType.CRYPTO:
+            stop_pips *= 1.5  # Higher volatility
+        elif market_profile.market_type == MarketType.FOREX:
+            stop_pips *= 1.0  # Standard
             
-            # Add timeframe and time
-            if timeframe != 'N/A':
-                signal += f"• *TIMEFRAME*: `{timeframe}`\n"
-            signal += f"• *TIME*: `{datetime.now(timezone.utc).strftime('%H:%M UTC')}`"
+        # Ensure minimum stop loss
+        min_stop = market_profile.spread * 3
+        stop_pips = max(stop_pips, min_stop)
+        
+        # Calculate stop loss price
+        pip_size = 0.0001 if "JPY" not in market_profile.symbol else 0.01
+        stop_distance = stop_pips * pip_size
+        
+        if direction == "SHORT":
+            stop_price = entry_price + stop_distance
+        else:  # LONG
+            stop_price = entry_price - stop_distance
             
-            # Send to Telegram
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            payload = {
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": signal,
-                "parse_mode": "Markdown"
+        return {
+            "stop_loss": stop_price,
+            "stop_pips": stop_pips,
+            "stop_distance": stop_distance
+        }
+    
+    def calculate_take_profits(self,
+                              entry_price: float,
+                              stop_pips: float,
+                              direction: str,
+                              rr_ratios: List[float]) -> List[Dict]:
+        """
+        Calculate multiple take-profit levels
+        """
+        tp_levels = []
+        pip_size = 0.0001  # Adjust based on symbol
+        
+        for i, ratio in enumerate(rr_ratios):
+            tp_pips = stop_pips * ratio
+            tp_distance = tp_pips * pip_size
+            
+            if direction == "SHORT":
+                tp_price = entry_price - tp_distance
+            else:  # LONG
+                tp_price = entry_price + tp_distance
+                
+            tp_levels.append({
+                "level": i + 1,
+                "price": tp_price,
+                "pips": tp_pips,
+                "rr_ratio": ratio,
+                "distance": tp_distance
+            })
+            
+        return tp_levels
+    
+    def calculate_position_size(self,
+                               account_balance: float,
+                               risk_percent: float,
+                               stop_pips: float,
+                               market_profile: MarketProfile) -> float:
+        """
+        Calculate position size based on risk parameters
+        """
+        risk_amount = account_balance * (risk_percent / 100)
+        
+        # Risk per pip in account currency
+        risk_per_pip = (risk_amount / stop_pips) if stop_pips > 0 else 0
+        
+        # Convert to lot size
+        position_size = risk_per_pip / (market_profile.pip_value * 10)
+        
+        # Standardize to lot sizes
+        if position_size < 0.01:
+            position_size = 0.01  # Minimum micro lot
+            
+        return round(position_size, 2)
+
+class MultiTimeframeAnalyzer:
+    """Analyze all timeframes for optimal entry/exit points"""
+    
+    def __init__(self):
+        self.support_resistance_levels = {}
+        
+    def analyze_timeframes(self, 
+                          symbol: str,
+                          price_data: Dict[TimeFrame, pd.DataFrame]) -> Dict:
+        """
+        Analyze all timeframes for the given symbol
+        """
+        analysis = {}
+        
+        for timeframe, data in price_data.items():
+            if len(data) < 50:  # Need enough data
+                continue
+                
+            # Calculate technical indicators
+            close_prices = data['close'].values
+            
+            # Simple moving averages
+            sma_20 = talib.SMA(close_prices, timeperiod=20)
+            sma_50 = talib.SMA(close_prices, timeperiod=50)
+            
+            # RSI
+            rsi = talib.RSI(close_prices, timeperiod=14)
+            
+            # ATR for volatility
+            atr = talib.ATR(data['high'].values, 
+                           data['low'].values, 
+                           close_prices, 
+                           timeperiod=14)
+            
+            # MACD
+            macd, macd_signal, macd_hist = talib.MACD(close_prices)
+            
+            # Find support and resistance
+            supports, resistances = self.find_support_resistance(data)
+            
+            analysis[timeframe] = {
+                "sma_20": sma_20[-1] if not np.isnan(sma_20[-1]) else None,
+                "sma_50": sma_50[-1] if not np.isnan(sma_50[-1]) else None,
+                "rsi": rsi[-1] if not np.isnan(rsi[-1]) else None,
+                "atr": atr[-1] if not np.isnan(atr[-1]) else None,
+                "macd": {
+                    "macd": macd[-1] if not np.isnan(macd[-1]) else None,
+                    "signal": macd_signal[-1] if not np.isnan(macd_signal[-1]) else None,
+                    "histogram": macd_hist[-1] if not np.isnan(macd_hist[-1]) else None
+                },
+                "supports": supports[-5:],  # Last 5 supports
+                "resistances": resistances[-5:],  # Last 5 resistances
+                "current_price": close_prices[-1],
+                "volatility": np.std(close_prices[-20:]) if len(close_prices) >= 20 else 0
             }
             
-            log(f"Sending to Telegram")
-            response = requests.post(url, json=payload, timeout=10)
-            log(f"Telegram response: {response.status_code}")
+        return analysis
+    
+    def find_support_resistance(self, data: pd.DataFrame) -> Tuple[List, List]:
+        """
+        Find support and resistance levels using pivot points
+        """
+        supports = []
+        resistances = []
+        
+        if len(data) < 20:
+            return supports, resistances
             
-            if response.status_code == 200:
-                log("Signal sent successfully")
-                return jsonify({"status": "success"}), 200
-            else:
-                log(f"Telegram error: {response.text}")
-                return jsonify({"status": "telegram_error"}), 200
-        else:
-            log("Missing credentials or invalid data")
-            return jsonify({"status": "invalid_data"}), 200
+        highs = data['high'].values
+        lows = data['low'].values
+        
+        for i in range(1, len(highs) - 1):
+            # Local maximum (resistance)
+            if highs[i] > highs[i-1] and highs[i] > highs[i+1]:
+                resistances.append(highs[i])
             
-    except Exception as e:
-        log(f"Webhook error: {e}")
-        return jsonify({"status": "error"}), 200
+            # Local minimum (support)
+            if lows[i] < lows[i-1] and lows[i] < lows[i+1]:
+                supports.append(lows[i])
+                
+        return supports, resistances
+    
+    def get_optimal_timeframe(self, analysis: Dict) -> TimeFrame:
+        """
+        Determine the optimal timeframe for entry based on multiple factors
+        """
+        timeframe_scores = {}
+        
+        for timeframe, data in analysis.items():
+            score = 0
+            
+            # Higher volatility timeframes get higher score for active trading
+            if timeframe in [TimeFrame.M1, TimeFrame.M3, TimeFrame.M5]:
+                score += 30
+            elif timeframe in [TimeFrame.M15, TimeFrame.M30]:
+                score += 20
+            elif timeframe == TimeFrame.H1:
+                score += 15
+                
+            # Score based on RSI
+            if data['rsi'] is not None:
+                if data['rsi'] < 30 or data['rsi'] > 70:  # Overbought/oversold
+                    score += 20
+                    
+            # Score based on MACD
+            if data['macd']['histogram'] is not None:
+                if abs(data['macd']['histogram']) > 0.001:  # Strong momentum
+                    score += 15
+                    
+            timeframe_scores[timeframe] = score
+            
+        # Return timeframe with highest score
+        return max(timeframe_scores, key=timeframe_scores.get)
 
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({
-        "status": "alive",
-        "telegram_configured": bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
-    }), 200
+class AdaptiveTradingBot:
+    """Main trading bot with adaptive parameters for all timeframes and markets"""
+    
+    def __init__(self, account_balance: float = 10000.0):
+        self.account_balance = account_balance
+        self.risk_manager = DynamicRiskManager()
+        self.analyzer = MultiTimeframeAnalyzer()
+        self.active_trades = {}
+        self.market_profiles = self.initialize_market_profiles()
+        
+        logger.info(f"Adaptive Trading Bot initialized with account balance: ${account_balance:,.2f}")
+        
+    def initialize_market_profiles(self) -> Dict[str, MarketProfile]:
+        """Initialize market profiles for different symbols"""
+        profiles = {
+            # Forex pairs
+            "EURUSD": MarketProfile(
+                symbol="EURUSD",
+                market_type=MarketType.FOREX,
+                avg_daily_range=70.0,
+                avg_true_range=8.5,
+                volatility_rank=45.0,
+                spread=0.0001,
+                pip_value=10.0
+            ),
+            "GBPUSD": MarketProfile(
+                symbol="GBPUSD",
+                market_type=MarketType.FOREX,
+                avg_daily_range=90.0,
+                avg_true_range=10.2,
+                volatility_rank=55.0,
+                spread=0.00012,
+                pip_value=10.0
+            ),
+            "USDJPY": MarketProfile(
+                symbol="USDJPY",
+                market_type=MarketType.FOREX,
+                avg_daily_range=65.0,
+                avg_true_range=7.8,
+                volatility_rank=40.0,
+                spread=0.01,
+                pip_value=9.0
+            ),
+            "EURCAD": MarketProfile(
+                symbol="EURCAD",
+                market_type=MarketType.FOREX,
+                avg_daily_range=85.0,
+                avg_true_range=9.5,
+                volatility_rank=50.0,
+                spread=0.00015,
+                pip_value=7.5
+            ),
+            # Cryptocurrencies
+            "BTCUSD": MarketProfile(
+                symbol="BTCUSD",
+                market_type=MarketType.CRYPTO,
+                avg_daily_range=3000.0,
+                avg_true_range=350.0,
+                volatility_rank=85.0,
+                spread=5.0,
+                pip_value=1.0,
+                lot_size=1.0  # Crypto lot size
+            ),
+            "ETHUSD": MarketProfile(
+                symbol="ETHUSD",
+                market_type=MarketType.CRYPTO,
+                avg_daily_range=150.0,
+                avg_true_range=18.0,
+                volatility_rank=75.0,
+                spread=0.5,
+                pip_value=1.0,
+                lot_size=1.0
+            ),
+            # Stocks (example)
+            "AAPL": MarketProfile(
+                symbol="AAPL",
+                market_type=MarketType.STOCKS,
+                avg_daily_range=3.5,
+                avg_true_range=0.42,
+                volatility_rank=35.0,
+                spread=0.01,
+                pip_value=1.0,
+                lot_size=100  # Stock lot size
+            )
+        }
+        
+        return profiles
+    
+    def process_signal(self, signal: TradeSignal, price_data: Dict) -> Optional[Dict]:
+        """
+        Process trading signal and generate trade parameters
+        """
+        if signal.symbol not in self.market_profiles:
+            logger.error(f"No market profile for symbol: {signal.symbol}")
+            return None
+            
+        # Get market profile
+        market_profile = self.market_profiles[signal.symbol]
+        
+        # Analyze all timeframes
+        timeframe_analysis = self.analyzer.analyze_timeframes(signal.symbol, price_data)
+        
+        if not timeframe_analysis:
+            logger.error("No timeframe analysis available")
+            return None
+            
+        # Get optimal timeframe for entry
+        optimal_tf = self.analyzer.get_optimal_timeframe(timeframe_analysis)
+        
+        # Get analysis for optimal timeframe
+        tf_analysis = timeframe_analysis[optimal_tf]
+        
+        # Adjust entry price based on timeframe analysis
+        adjusted_entry = self.adjust_entry_price(
+            signal.entry_price,
+            signal.direction,
+            tf_analysis
+        )
+        
+        # Calculate dynamic stop loss
+        stop_data = self.risk_manager.calculate_dynamic_stop_loss(
+            market_profile=market_profile,
+            timeframe=optimal_tf,
+            entry_price=adjusted_entry,
+            direction=signal.direction
+        )
+        
+        # Get RR ratios for timeframe
+        rr_ratios = self.risk_manager.timeframe_config[optimal_tf]["rr_ratios"]
+        
+        # Calculate take-profit levels
+        tp_levels = self.risk_manager.calculate_take_profits(
+            entry_price=adjusted_entry,
+            stop_pips=stop_data["stop_pips"],
+            direction=signal.direction,
+            rr_ratios=rr_ratios
+        )
+        
+        # Calculate position size
+        position_size = self.risk_manager.calculate_position_size(
+            account_balance=self.account_balance,
+            risk_percent=1.0,  # 1% risk per trade
+            stop_pips=stop_data["stop_pips"],
+            market_profile=market_profile
+        )
+        
+        # Create trade plan
+        trade_plan = {
+            "symbol": signal.symbol,
+            "direction": signal.direction,
+            "market_type": market_profile.market_type.value,
+            "optimal_timeframe": optimal_tf.value,
+            "entry_price": adjusted_entry,
+            "original_signal_price": signal.entry_price,
+            "stop_loss": stop_data["stop_loss"],
+            "stop_pips": stop_data["stop_pips"],
+            "take_profits": tp_levels,
+            "position_size": position_size,
+            "risk_amount": self.account_balance * 0.01,  # 1% risk
+            "risk_reward_ratios": rr_ratios,
+            "signal_strength": signal.signal_strength,
+            "confidence": signal.confidence,
+            "timestamp": datetime.now(),
+            "timeframe_analysis": {
+                tf.value: {
+                    "current_price": analysis["current_price"],
+                    "rsi": analysis["rsi"],
+                    "atr": analysis["atr"],
+                    "volatility": analysis["volatility"]
+                } for tf, analysis in timeframe_analysis.items()
+            }
+        }
+        
+        # Log trade plan
+        self.log_trade_plan(trade_plan)
+        
+        return trade_plan
+    
+    def adjust_entry_price(self, 
+                          original_entry: float,
+                          direction: str,
+                          tf_analysis: Dict) -> float:
+        """
+        Adjust entry price based on support/resistance levels
+        """
+        adjusted_entry = original_entry
+        
+        # Use nearest support/resistance for better entry
+        if direction == "LONG":
+            supports = tf_analysis.get("supports", [])
+            if supports:
+                # Find closest support below current price
+                valid_supports = [s for s in supports if s < original_entry]
+                if valid_supports:
+                    adjusted_entry = max(valid_supports)
+                    
+        elif direction == "SHORT":
+            resistances = tf_analysis.get("resistances", [])
+            if resistances:
+                # Find closest resistance above current price
+                valid_resistances = [r for r in resistances if r > original_entry]
+                if valid_resistances:
+                    adjusted_entry = min(valid_resistances)
+                    
+        return adjusted_entry
+    
+    def log_trade_plan(self, trade_plan: Dict):
+        """Log detailed trade plan"""
+        logger.info("=" * 80)
+        logger.info("ADAPTIVE TRADE PLAN GENERATED")
+        logger.info("=" * 80)
+        logger.info(f"Symbol: {trade_plan['symbol']}")
+        logger.info(f"Market Type: {trade_plan['market_type']}")
+        logger.info(f"Direction: {trade_plan['direction']}")
+        logger.info(f"Optimal Timeframe: {trade_plan['optimal_timeframe']}")
+        logger.info(f"Entry Price: {trade_plan['entry_price']:.5f}")
+        logger.info(f"Stop Loss: {trade_plan['stop_loss']:.5f} ({trade_plan['stop_pips']:.1f} pips)")
+        logger.info(f"Position Size: {trade_plan['position_size']:.2f} lots")
+        logger.info(f"Risk Amount: ${trade_plan['risk_amount']:.2f}")
+        
+        for tp in trade_plan["take_profits"]:
+            logger.info(f"TP{tp['level']}: {tp['price']:.5f} ({tp['pips']:.1f} pips, {tp['rr_ratio']}:1 RR)")
+            
+        logger.info(f"Signal Strength: {trade_plan['signal_strength']}/100")
+        logger.info(f"Confidence: {trade_plan['confidence']*100:.1f}%")
+        logger.info("=" * 80)
+        
+        # Log timeframe analysis summary
+        logger.info("TIMEFRAME ANALYSIS SUMMARY:")
+        for tf, data in trade_plan["timeframe_analysis"].items():
+            logger.info(f"  {tf}: Price={data['current_price']:.5f}, "
+                       f"RSI={data['rsi']:.1f if data['rsi'] else 'N/A'}, "
+                       f"ATR={data['atr']:.5f if data['atr'] else 'N/A'}")
+    
+    def execute_trade(self, trade_plan: Dict):
+        """Execute the trade (simulated for this example)"""
+        trade_id = f"{trade_plan['symbol']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        # Simulate trade execution
+        logger.info(f"Executing trade {trade_id}")
+        
+        # Store trade information
+        self.active_trades[trade_id] = {
+            **trade_plan,
+            "trade_id": trade_id,
+            "status": "ACTIVE",
+            "entry_time": datetime.now(),
+            "current_pnl": 0.0
+        }
+        
+        return trade_id
+    
+    def monitor_trades(self):
+        """Monitor all active trades (simulated)"""
+        while self.active_trades:
+            for trade_id, trade in list(self.active_trades.items()):
+                # Simulate price movement (in real implementation, get from market data)
+                current_price = self.simulate_price_movement(trade)
+                
+                # Check exit conditions
+                self.check_exit_conditions(trade_id, current_price)
+                
+                # Update PnL
+                self.update_pnl(trade_id, current_price)
+                
+            time.sleep(1)  # Simulate monitoring interval
+    
+    def simulate_price_movement(self, trade: Dict) -> float:
+        """Simulate price movement for demo purposes"""
+        base_price = trade["entry_price"]
+        direction = 1 if trade["direction"] == "LONG" else -1
+        
+        # Simulate random walk
+        movement = np.random.randn() * trade["stop_pips"] * 0.0001 * 0.1
+        
+        return base_price + (direction * movement)
+    
+    def check_exit_conditions(self, trade_id: str, current_price: float):
+        """Check if exit conditions are met"""
+        trade = self.active_trades[trade_id]
+        
+        # Check stop loss
+        if trade["direction"] == "LONG" and current_price <= trade["stop_loss"]:
+            self.exit_trade(trade_id, current_price, "STOP_LOSS")
+            return
+            
+        if trade["direction"] == "SHORT" and current_price >= trade["stop_loss"]:
+            self.exit_trade(trade_id, current_price, "STOP_LOSS")
+            return
+            
+        # Check take profits
+        for tp in trade["take_profits"]:
+            if trade["direction"] == "LONG" and current_price >= tp["price"]:
+                self.exit_trade(trade_id, current_price, f"TP{tp['level']}")
+                return
+                
+            if trade["direction"] == "SHORT" and current_price <= tp["price"]:
+                self.exit_trade(trade_id, current_price, f"TP{tp['level']}")
+                return
+    
+    def exit_trade(self, trade_id: str, exit_price: float, exit_reason: str):
+        """Exit a trade"""
+        trade = self.active_trades[trade_id]
+        
+        # Calculate PnL
+        if trade["direction"] == "LONG":
+            pips = (exit_price - trade["entry_price"]) * 10000
+            pnl = pips * trade["position_size"] * trade.get("pip_value", 10.0)
+        else:  # SHORT
+            pips = (trade["entry_price"] - exit_price) * 10000
+            pnl = pips * trade["position_size"] * trade.get("pip_value", 10.0)
+        
+        # Update account balance
+        self.account_balance += pnl
+        
+        # Log exit
+        logger.info(f"Trade {trade_id} exited: {exit_reason}")
+        logger.info(f"Exit Price: {exit_price:.5f}")
+        logger.info(f"Pips: {pips:.1f}")
+        logger.info(f"PnL: ${pnl:.2f}")
+        logger.info(f"New Account Balance: ${self.account_balance:.2f}")
+        
+        # Remove from active trades
+        del self.active_trades[trade_id]
+    
+    def update_pnl(self, trade_id: str, current_price: float):
+        """Update current PnL for active trade"""
+        trade = self.active_trades[trade_id]
+        
+        if trade["direction"] == "LONG":
+            pips = (current_price - trade["entry_price"]) * 10000
+            pnl = pips * trade["position_size"] * trade.get("pip_value", 10.0)
+        else:  # SHORT
+            pips = (trade["entry_price"] - current_price) * 10000
+            pnl = pips * trade["position_size"] * trade.get("pip_value", 10.0)
+        
+        trade["current_pnl"] = pnl
+        
+        # Log significant PnL changes
+        if abs(pnl) > trade["risk_amount"] * 0.5:
+            logger.info(f"Trade {trade_id}: PnL = ${pnl:.2f}")
 
-@app.route('/test', methods=['POST'])
-def test():
-    """Test endpoint with TradingView format"""
-    test_data = "USDCAD buy @ 1.36890 on 5"
-    parsed = parse_tradingview_text(test_data)
-    return jsonify({
-        "test": test_data,
-        "parsed": parsed
-    }), 200
+# Example usage
+def main():
+    """Example of using the adaptive trading bot"""
+    
+    # Initialize bot
+    bot = AdaptiveTradingBot(account_balance=10000.0)
+    
+    # Simulate price data for multiple timeframes
+    def generate_sample_data(symbol: str, base_price: float) -> Dict[TimeFrame, pd.DataFrame]:
+        """Generate sample price data for testing"""
+        data = {}
+        
+        for timeframe in TimeFrame:
+            # Generate OHLC data
+            periods = 100
+            dates = pd.date_range(end=datetime.now(), periods=periods, freq='T')
+            
+            # Generate random walk
+            returns = np.random.randn(periods) * 0.001
+            price = base_price * np.exp(np.cumsum(returns))
+            
+            # Create OHLC dataframe
+            df = pd.DataFrame({
+                'open': price * 0.999,
+                'high': price * 1.001,
+                'low': price * 0.997,
+                'close': price,
+                'volume': np.random.randint(1000, 10000, periods)
+            }, index=dates)
+            
+            data[timeframe] = df
+            
+        return data
+    
+    # Create sample trading signal
+    signal = TradeSignal(
+        symbol="EURCAD",
+        direction="SHORT",
+        entry_price=1.61159,
+        signal_strength=85.0,
+        confidence=0.8,
+        timestamp=datetime.now(),
+        indicators={"rsi": 65.0, "macd": -0.0012}
+    )
+    
+    # Generate sample price data
+    price_data = generate_sample_data("EURCAD", 1.61159)
+    
+    # Process signal and generate trade plan
+    trade_plan = bot.process_signal(signal, price_data)
+    
+    if trade_plan:
+        # Execute trade
+        trade_id = bot.execute_trade(trade_plan)
+        
+        # Start monitoring (in real implementation, this would be in a separate thread)
+        logger.info("Starting trade monitoring...")
+        
+        # Monitor for 10 seconds in demo
+        for i in range(10):
+            for trade_id, trade in list(bot.active_trades.items()):
+                current_price = bot.simulate_price_movement(trade)
+                bot.check_exit_conditions(trade_id, current_price)
+                bot.update_pnl(trade_id, current_price)
+            time.sleep(1)
+    
+    logger.info("Trading bot execution completed")
 
-if __name__ == '__main__':
-    port = int(os.getenv('PORT', 5000))
-    log(f"Starting server on port {port}")
-    app.run(host='0.0.0.0', port=port, debug=False)
+if __name__ == "__main__":
+    main()
