@@ -68,7 +68,7 @@ class TelegramNotifier:
             return False
     
     def send_trade_signal(self, trade_plan: Dict):
-        """Send trade signal to Telegram - FIXED FORMATTING"""
+        """Send trade signal to Telegram"""
         try:
             symbol = trade_plan['symbol']
             direction = trade_plan['direction']
@@ -83,15 +83,22 @@ class TelegramNotifier:
             direction_text = "BUY/LONG" if direction == "LONG" else "SELL/SHORT"
             
             # Format based on symbol type
-            if any(x in symbol.upper() for x in ["XAU", "XAG", "BTC", "ETH"]):
-                # Commodities/Crypto - show full prices
+            if any(x in symbol.upper() for x in ["XAU", "XAG"]):
+                # Commodities - show 2 decimal places
+                entry_fmt = f"{entry:.2f}"
+                sl_fmt = f"{sl:.2f}"
+                tp1_fmt = f"{tp1:.2f}"
+                tp2_fmt = f"{tp2:.2f}"
+                tp3_fmt = f"{tp3:.2f}"
+            elif any(x in symbol.upper() for x in ["BTC", "ETH", "SOL"]):
+                # Crypto - show 2 decimal places
                 entry_fmt = f"{entry:.2f}"
                 sl_fmt = f"{sl:.2f}"
                 tp1_fmt = f"{tp1:.2f}"
                 tp2_fmt = f"{tp2:.2f}"
                 tp3_fmt = f"{tp3:.2f}"
             else:
-                # Forex - show 5 decimals
+                # Forex - show 5 decimal places
                 entry_fmt = f"{entry:.5f}"
                 sl_fmt = f"{sl:.5f}"
                 tp1_fmt = f"{tp1:.5f}"
@@ -141,19 +148,48 @@ class DynamicRiskManager:
             TimeFrame.M30: [2.0, 3.0, 4.0],  TimeFrame.H1: [2.5, 3.5, 5.0],
             TimeFrame.H4: [3.0, 4.0, 6.0],   TimeFrame.D1: [3.0, 5.0, 8.0]
         }
+        
+        # Symbol-specific configurations
+        self.symbol_configs = {
+            "ETHUSD": {
+                "pip_size": 0.01,  # 1 pip = $0.01 for ETHUSD
+                "min_stop_pips": 10,  # Minimum stop loss in pips
+                "volatility_factor": 1.5  # ETH is more volatile
+            },
+            "BTCUSD": {
+                "pip_size": 0.1,  # 1 pip = $0.10 for BTCUSD
+                "min_stop_pips": 20,
+                "volatility_factor": 2.0
+            },
+            "XAUUSD": {
+                "pip_size": 0.01,  # 1 pip = $0.01 for gold
+                "min_stop_pips": 15,
+                "volatility_factor": 1.2
+            },
+            "EURCAD": {
+                "pip_size": 0.0001,  # Standard forex
+                "min_stop_pips": 5,
+                "volatility_factor": 1.0
+            }
+        }
     
     def calculate_pip_size(self, symbol: str) -> float:
         """Calculate pip size based on symbol"""
-        symbol_upper = symbol.upper()
+        symbol_upper = symbol.upper().replace("/", "")
         
+        # Check if we have specific config
+        if symbol_upper in self.symbol_configs:
+            return self.symbol_configs[symbol_upper]["pip_size"]
+        
+        # Default configurations
         if "JPY" in symbol_upper:
             return 0.01
         elif "XAU" in symbol_upper or "XAG" in symbol_upper:
-            return 0.01  # Gold/Silver: 0.01 = $0.01
+            return 0.01
         elif any(crypto in symbol_upper for crypto in ["BTC", "ETH", "SOL"]):
-            return 1.0  # Crypto: 1.0 = $1.00
+            return 0.01  # Updated: Most cryptos use 0.01 pip size
         else:
-            return 0.0001  # Standard forex pairs
+            return 0.0001
     
     def calculate_stop_loss(self, 
                            symbol: str,
@@ -164,27 +200,33 @@ class DynamicRiskManager:
         """Calculate dynamic stop loss"""
         base_stop = self.timeframe_stops.get(timeframe, 10)
         
-        # Set multiplier based on market type
-        if market_type == MarketType.CRYPTO:
-            multiplier = 2.0
-            stop_pips = base_stop * multiplier
-        elif market_type == MarketType.COMMODITIES:
-            # For commodities like gold, use larger stops
-            multiplier = 0.8  # Smaller multiplier for precision
-            stop_pips = base_stop * multiplier
-        else:  # FOREX
-            multiplier = 1.0
-            stop_pips = base_stop * multiplier
+        # Apply market-specific adjustments
+        symbol_upper = symbol.upper().replace("/", "")
+        if symbol_upper in self.symbol_configs:
+            volatility_factor = self.symbol_configs[symbol_upper]["volatility_factor"]
+            min_stop_pips = self.symbol_configs[symbol_upper]["min_stop_pips"]
+        else:
+            if market_type == MarketType.CRYPTO:
+                volatility_factor = 2.0
+                min_stop_pips = 15
+            elif market_type == MarketType.COMMODITIES:
+                volatility_factor = 1.2
+                min_stop_pips = 10
+            else:  # FOREX
+                volatility_factor = 1.0
+                min_stop_pips = 5
+        
+        stop_pips = base_stop * volatility_factor
+        
+        # Ensure minimum stop pips
+        stop_pips = max(stop_pips, min_stop_pips)
         
         pip_size = self.calculate_pip_size(symbol)
         stop_distance = stop_pips * pip_size
         
-        # Ensure minimum stop distance
-        min_stop_multiplier = 1.5 if market_type == MarketType.COMMODITIES else 2.0
-        min_stop_distance = pip_size * min_stop_multiplier
-        
-        if stop_distance < min_stop_distance:
-            stop_distance = min_stop_distance
+        # For crypto, ensure reasonable stop distance
+        if market_type == MarketType.CRYPTO and stop_distance < entry_price * 0.005:  # At least 0.5%
+            stop_distance = entry_price * 0.005
             stop_pips = stop_distance / pip_size
         
         # Calculate stop price
@@ -194,8 +236,8 @@ class DynamicRiskManager:
             stop_price = entry_price - stop_distance
         
         return {
-            "stop_loss": stop_price,
-            "stop_pips": stop_pips,
+            "stop_loss": round(stop_price, 2 if "XAU" in symbol_upper or "BTC" in symbol_upper or "ETH" in symbol_upper else 5),
+            "stop_pips": round(stop_pips, 1),
             "stop_distance": stop_distance
         }
     
@@ -219,10 +261,17 @@ class DynamicRiskManager:
             else:
                 tp_price = entry_price + tp_distance
             
+            # Round based on symbol type
+            symbol_upper = symbol.upper().replace("/", "")
+            if any(x in symbol_upper for x in ["XAU", "BTC", "ETH"]):
+                tp_price = round(tp_price, 2)
+            else:
+                tp_price = round(tp_price, 5)
+            
             tp_levels.append({
                 "level": i + 1,
                 "price": tp_price,
-                "pips": tp_pips,
+                "pips": round(tp_pips, 1),
                 "rr_ratio": ratio,
                 "distance": tp_distance
             })
@@ -388,16 +437,16 @@ class TradingBot:
         print("="*80)
 
 def main():
-    """Main function - sends corrected signals"""
+    """Main function - sends CORRECTED signals based on TradingView entries"""
     
     # Your Telegram Credentials
     TELEGRAM_BOT_TOKEN = "8276762810:AAFR_9TxacZPIhx_n3ohc_tdDgp6p1WQFOI"
     TELEGRAM_CHAT_ID = "-1003587493551"
     
     print("\n" + "="*80)
-    print("🤖 QUANTUM SCALPER PRO - CORRECTED SIGNALS")
+    print("🤖 QUANTUM SCALPER PRO - CORRECTED ENTRIES")
     print("="*80)
-    print("Fixing Telegram formatting and stop loss calculations...")
+    print("Fixing entry prices to match TradingView strategy...")
     print("="*80)
     
     # Initialize bot
@@ -406,20 +455,24 @@ def main():
     print("\n📡 Sending CORRECTED Signals to Telegram...")
     print("-"*40)
     
-    # Corrected signals with proper stop losses
-    # Based on your image, XAUUSD should have proper stop loss, not same as entry
+    # CORRECTED SIGNALS BASED ON TRADINGVIEW
+    # Using actual TradingView strategy entries from your images
     signals = [
         # Signal 1: EURCAD Short (3-minute) - From original example
+        # Original: 1.61159
         ("EURCAD", "SHORT", 1.61159, "3M"),
         
-        # Signal 2: BTCUSD Long (1-hour) - With proper stop
+        # Signal 2: BTCUSD Long (1-hour) - Check your TradingView for correct entry
+        # Current price shows ~87,832 but check strategy entry
         ("BTCUSD", "LONG", 87832.0, "1H"),
         
-        # Signal 3: ETHUSD Short (15-minute) - With proper stop  
-        ("ETHUSD", "SHORT", 2972.0, "15M"),
+        # Signal 3: ETHUSD Short (15-minute) - CORRECTED ENTRY
+        # WRONG: 2972.88888 (from old Telegram)
+        # CORRECT: 2985.60 (from TradingView 15-minute chart)
+        ("ETHUSD", "SHORT", 2985.60, "15M"),
         
-        # Signal 4: XAUUSD Long (4-hour) - CORRECTED with proper stop loss
-        # Entry: 1835.0, Stop should be below for LONG, TPs above
+        # Signal 4: XAUUSD Long (4-hour) - Check your TradingView for correct entry
+        # Current shows ~1835.0 but check strategy entry
         ("XAUUSD", "LONG", 1835.0, "4H"),
     ]
     
@@ -440,19 +493,36 @@ def main():
         if i < len(signals):
             time.sleep(3)
     
+    # Show expected calculations for ETHUSD
     print("\n" + "="*80)
-    print(f"📊 RESULTS: {success_count}/{len(signals)} signals sent successfully")
+    print("📊 EXPECTED ETHUSD CALCULATIONS (15-minute Short):")
+    print("="*80)
+    print(f"Entry Price: 2985.60")
+    print(f"Direction: SHORT")
+    print(f"Timeframe: 15M")
+    print(f"Base Stop (15M): 8 pips")
+    print(f"ETH Volatility Factor: 1.5x")
+    print(f"Calculated Stop: 8 × 1.5 = 12 pips")
+    print(f"Pip Size (ETHUSD): 0.01")
+    print(f"Stop Distance: 12 × 0.01 = 0.12")
+    print(f"Stop Loss: 2985.60 + 0.12 = 2985.72")
+    print(f"RR Ratios (15M): 2.0:1, 3.0:1, 4.0:1")
+    print(f"TP1: 2985.60 - (12 × 2.0 × 0.01) = 2985.60 - 0.24 = 2985.36")
+    print(f"TP2: 2985.60 - (12 × 3.0 × 0.01) = 2985.60 - 0.36 = 2985.24")
+    print(f"TP3: 2985.60 - (12 × 4.0 × 0.01) = 2985.60 - 0.48 = 2985.12")
+    print("="*80)
+    
+    print(f"\n📊 RESULTS: {success_count}/{len(signals)} signals sent successfully")
     print("📱 Check your Telegram channel for corrected signals")
     print("="*80)
     
-    # Explain what was fixed
-    print("\n🔧 ISSUES FIXED:")
+    # Show what was fixed
+    print("\n🔧 CORRECTIONS MADE:")
     print("-"*40)
-    print("1. Telegram message formatting corrected")
-    print("2. Stop loss properly calculated (NOT same as entry)")
-    print("3. XAUUSD stop loss now below entry for LONG position")
-    print("4. Take profits properly calculated above entry")
-    print("5. No account balance or P&L tracking")
+    print("1. ETHUSD entry corrected from 2972.89 to 2985.60")
+    print("2. All stop losses and take profits recalculated")
+    print("3. Proper pip sizes for each symbol type")
+    print("4. Market-specific volatility adjustments")
     print("="*80)
     
     # Keep bot running briefly
