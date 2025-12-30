@@ -39,6 +39,8 @@ class TimeframeCalculator:
         # Intraday timeframes
         '1m': TimeframeConfig(multiplier=0.3, risk_multiplier=0.5, sl_multiplier=0.7, tp_multiplier=0.8, min_confidence=0.7, valid_for_hours=0.5),
         '2m': TimeframeConfig(multiplier=0.4, risk_multiplier=0.6, sl_multiplier=0.75, tp_multiplier=0.85, min_confidence=0.65, valid_for_hours=1),
+        '3m': TimeframeConfig(multiplier=0.45, risk_multiplier=0.65, sl_multiplier=0.78, tp_multiplier=0.88, min_confidence=0.62, valid_for_hours=1.5),
+        '4m': TimeframeConfig(multiplier=0.48, risk_multiplier=0.68, sl_multiplier=0.79, tp_multiplier=0.89, min_confidence=0.61, valid_for_hours=1.5),
         '5m': TimeframeConfig(multiplier=0.5, risk_multiplier=0.7, sl_multiplier=0.8, tp_multiplier=0.9, min_confidence=0.6, valid_for_hours=2),
         '15m': TimeframeConfig(multiplier=0.7, risk_multiplier=0.8, sl_multiplier=0.85, tp_multiplier=1.0, min_confidence=0.55, valid_for_hours=4),
         '30m': TimeframeConfig(multiplier=0.8, risk_multiplier=0.9, sl_multiplier=0.9, tp_multiplier=1.1, min_confidence=0.5, valid_for_hours=8),
@@ -102,8 +104,12 @@ class TimeframeCalculator:
         
         # Map common aliases
         tf_map = {
-            '1': '1m', '5': '5m', '15': '15m', '30': '30m',
-            '60': '1H', '240': '4H', '1440': '1D', '10080': '1W'
+            '1': '1m', '2': '2m', '3': '3m', '4': '4m', '5': '5m',
+            '10': '10m', '15': '15m', '30': '30m',
+            '60': '1H', '120': '2H', '240': '4H', '360': '6H', '480': '8H', '720': '12H',
+            'D': '1D', '1D': '1D', '1440': '1D',
+            'W': '1W', '1W': '1W', '10080': '1W',
+            'M': '1M', '1M': '1M'
         }
         
         tf = tf_map.get(tf, tf)
@@ -254,7 +260,7 @@ class SignalValidator:
             
             # Check if signal is expired
             if 'entry_time' in signal_data:
-                entry_time = datetime.fromtimestamp(signal_data['entry_time'] / 1000, timezone.utc)
+                entry_time = datetime.fromtimestamp(int(signal_data['entry_time']) / 1000, timezone.utc)
                 tf_config = self.timeframe_calc.get_timeframe_config(timeframe)
                 max_age = timedelta(hours=tf_config.valid_for_hours)
                 
@@ -560,23 +566,22 @@ def handle_webhook():
         # Parse based on alert mode
         signal_data = {}
         
-        if ALERT_MODE == 'enhanced':
+        if ALERT_MODE == "enhanced":
             try:
                 # Try to parse as JSON first
                 signal_data = json.loads(raw_data)
                 logger.info("Parsed as JSON alert")
             except json.JSONDecodeError:
-                # Fallback to text parsing
-                logger.info("Falling back to text parsing")
-                # Simple text parsing
-                parts = raw_data.split()
-                if len(parts) >= 4:
-                    signal_data = {
-                        'pair': parts[0],
-                        'action': parts[1],
-                        'price': float(parts[3]) if len(parts) > 3 else 0,
-                        'timeframe': parts[-1] if 'on' in raw_data else '1H'
-                    }
+                # Attempt to fix common JSON issues, like extra quotes or missing braces
+                fixed_data = raw_data.replace('true"', 'true').replace('false"', 'false').replace(',}', '}')
+                if not raw_data.endswith('}'):
+                    fixed_data += '}'
+                try:
+                    signal_data = json.loads(fixed_data)
+                    logger.info("Parsed after fixing JSON")
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse JSON even after fix: {e}")
+                    return jsonify({"status": "parse_error", "message": str(e)}), 200
         else:
             # Basic mode - simple parsing
             parts = raw_data.split()
@@ -592,6 +597,28 @@ def handle_webhook():
         if not signal_data or 'pair' not in signal_data or 'action' not in signal_data:
             logger.error("Invalid signal data received")
             return jsonify({"status": "invalid_data"}), 200
+        
+        # Convert types (since now all are strings from Pine)
+        signal_data['price'] = float(signal_data['price'])
+        signal_data['adx_val'] = float(signal_data['adx_val'])
+        signal_data['ranging'] = str(signal_data['ranging']).lower() == 'true'
+        signal_data['volatility'] = float(signal_data['volatility'])
+        signal_data['bb_upper'] = float(signal_data['bb_upper'])
+        signal_data['bb_middle'] = float(signal_data['bb_middle'])
+        signal_data['bb_lower'] = float(signal_data['bb_lower'])
+        signal_data['entry_time'] = int(signal_data['entry_time'])
+        if 'atr' in signal_data:
+            signal_data['atr'] = float(signal_data['atr'])
+        if 'adaptive_mult' in signal_data:
+            signal_data['adaptive_mult'] = float(signal_data['adaptive_mult'])
+        if 'avg_profit' in signal_data:
+            signal_data['avg_profit'] = float(signal_data['avg_profit'])
+        if 'sl_price' in signal_data:
+            signal_data['sl_price'] = float(signal_data['sl_price'])
+        if 'tp_price' in signal_data:
+            signal_data['tp_price'] = float(signal_data['tp_price'])
+        if 'position_size' in signal_data:
+            signal_data['position_size'] = float(signal_data['position_size'])
         
         # Normalize timeframe
         if 'timeframe' in signal_data:
@@ -833,11 +860,3 @@ if __name__ == '__main__':
     logger.info(f"🤖 Telegram configured: {bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)}")
     
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
-
-if __name__ == '__main__':
-    port = int(os.getenv('PORT', 5000))
-    logger.info(f"🚀 Starting Timeframe-Aware Trading Bot v7.1 on port {port}")
-    logger.info(f"🔧 Alert Mode: {ALERT_MODE}")
-    logger.info(f"🤖 Telegram configured: {bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)}")
-    
-    # app.run(...)  # Removed for production; handled by Gunicorn
